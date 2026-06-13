@@ -1,0 +1,45 @@
+{
+  "name": "jlc-eda-companion",
+  "version": "0.1.0",
+  "description": "嘉立创 EDA PCB设计全流程助手 — 阶段一：芯片选型与外围电路BOM生成",
+  "author": "jlc-eda-companion",
+  "tools": [
+    {
+      "name": "search_lcsc",
+      "command": "python jlc-eda-companion/tools/search_lcsc.py",
+      "description": "搜索立创商城元器件（芯片、电阻、电容），返回库存、价格、封装、JLCPCB贴片状态",
+      "args": ["--format", "json"]
+    },
+    {
+      "name": "compute_passive",
+      "command": "python jlc-eda-companion/tools/compute_passive.py",
+      "description": "阻容值计算器：欧姆定律、分压计算、RC滤波截止频率、晶振负载电容、555定时器",
+      "args": ["--format", "json"]
+    },
+    {
+      "name": "fetch_datasheet",
+      "command": "python jlc-eda-companion/tools/fetch_datasheet.py",
+      "description": "从立创商城爬取元器件数据手册 PDF，支持 URL 提取和本地下载",
+      "args": ["--format", "json"]
+    },
+    {
+      "name": "parse_datasheet",
+      "command": "python jlc-eda-companion/tools/parse_datasheet.py",
+      "description": "解析数据手册 PDF 为 Markdown，提取引脚定义、电气特性、参考电路等关键章节",
+      "args": ["--format", "json"]
+    }
+  ],
+  "prompts": {
+    "phase1": "jlc-eda-companion/prompts/phase1_solution_generation.md"
+  },
+  "phases": {
+    "1": {
+      "name": "解决方案生成",
+      "role": "active_guide",
+      "triggers": ["选型", "芯片", "BOM", "数据手册", "datasheet", "外围电路", "参考设计",
+                    "方案", "手册", "规格书", "LCSC", "立创", "原理图开始"],
+      "description": "需求澄清→芯片选型(LCSC搜索)→数据手册下载与解析→外围电路BOM生成"
+    }
+  },
+  "requires_mcp": []
+}
