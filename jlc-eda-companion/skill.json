@@ -1,7 +1,7 @@
 {
   "name": "jlc-eda-companion",
-  "version": "0.1.0",
-  "description": "嘉立创 EDA PCB设计全流程助手 — 阶段一：芯片选型与外围电路BOM生成",
+  "version": "0.2.0",
+  "description": "嘉立创 EDA PCB设计全流程助手 — 阶段一：芯片选型与BOM | 阶段二：原理图ERC审查",
   "author": "jlc-eda-companion",
   "tools": [
     {
@@ -25,12 +25,31 @@
     {
       "name": "parse_datasheet",
       "command": "python jlc-eda-companion/tools/parse_datasheet.py",
-      "description": "解析数据手册 PDF 为 Markdown，提取引脚定义、电气特性、参考电路等关键章节",
+      "description": "解析数据手册 PDF 为 Markdown，按章节拆分为独立文件并生成 index.md 索引（标注 PCB 设计关键章节）",
+      "args": ["process", "--format", "json"]
+    },
+    {
+      "name": "parse_jlc_project",
+      "command": "python jlc-eda-companion/tools/parse_jlc_project.py",
+      "description": "解析嘉立创 EDA 工程文件（.eprj2 / .epro2 / .zip），提取元件、连线和 LCSC 编号",
       "args": ["--format", "json"]
+    },
+    {
+      "name": "extract_netlist",
+      "command": "python jlc-eda-companion/tools/extract_netlist.py",
+      "description": "从工程解析结果提取网表，通过 WIRE 拓扑重建网络连接和引脚映射",
+      "args": ["--stdin", "--format", "json"]
+    },
+    {
+      "name": "phase2_erc_check",
+      "command": "python jlc-eda-companion/tools/phase2_erc_check.py",
+      "description": "ERC 电气规则检查引擎（7项）：去耦电容、EN/复位上下拉、I2C上拉、反馈分压、晶振电容、悬空引脚、电源短路",
+      "args": ["--stdin"]
     }
   ],
   "prompts": {
-    "phase1": "jlc-eda-companion/prompts/phase1_solution_generation.md"
+    "phase1": "jlc-eda-companion/prompts/phase1_solution_generation.md",
+    "phase2": "jlc-eda-companion/prompts/phase2_schematic_erc.md"
   },
   "phases": {
     "1": {
@@ -39,6 +58,15 @@
       "triggers": ["选型", "芯片", "BOM", "数据手册", "datasheet", "外围电路", "参考设计",
                     "方案", "手册", "规格书", "LCSC", "立创", "原理图开始"],
       "description": "需求澄清→芯片选型(LCSC搜索)→数据手册下载与解析→外围电路BOM生成"
+    },
+    "2": {
+      "name": "原理图 ERC 审查",
+      "role": "reviewer",
+      "triggers": ["ERC", "电气规则检查", "原理图审查", "检查原理图", "原理图检查",
+                    "去耦电容", "上拉电阻", "I2C上拉", "反馈电阻", "晶振电容",
+                    "悬空引脚", "电源短路", "浮空", ".eprj2", ".epro2", "工程文件",
+                    "提取网表", "网表", "netlist"],
+      "description": "解析嘉立创EDA工程→提取网表→7项ERC检查→对照数据手册生成审查报告"
     }
   },
   "requires_mcp": []

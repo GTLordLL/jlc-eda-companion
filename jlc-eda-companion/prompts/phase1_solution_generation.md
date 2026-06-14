@@ -41,26 +41,22 @@
   ├── 备用：制造商官网搜索
   └── 或用户提供 PDF 文件路径
 
-③ 解析 PDF → Markdown
-  ├── 自动解析：运行 parse_datasheet.py 将 PDF 转为 Markdown + 提取关键章节
-  │   命令: python tools/parse_datasheet.py ./datasheets/C8734.pdf --extract --format json
-  ├── 若 parse_datasheet.py 解析失败：备选方案
-  │   ├── 备选1: 换后端 python tools/parse_datasheet.py C8734.pdf --backend pypdf
-  │   ├── 备选2: 手动运行 docling CLI (如果已安装)
-  │   │   命令: docling convert C8734.pdf C8734.md
-  │   └── 备选3: LCSC 产品页查看 (search_lcsc 结果中的 lcsc_url)
-  └── 关键章节（parse_datasheet 自动提取）：
-      - Pinout & Pin Description（引脚定义）→ sections.pinout
-      - Typical Application Circuit（典型应用电路）→ sections.application_circuit
-      - Electrical Characteristics（电气特性）→ sections.electrical_characteristics
-      - Absolute Maximum Ratings（极限参数）→ sections.absolute_maximum
-      - Layout Guidelines（PCB 布局指导）→ sections.layout_guidelines
-      - Package Information（封装信息）→ sections.package_info
+③ 解析 PDF → Markdown + 章节拆分
+  ├── 自动解析：运行 parse_datasheet.py 将 PDF 按章节拆分为独立 .md 文件
+  │   命令: python tools/parse_datasheet.py process ./datasheets/C8734.pdf --format json
+  ├── 返回: output_dir 目录路径 + chapter 列表（含 pcd_relevant 标注）
+  ├── 若解析失败：LCSC 产品页直接查看（search_lcsc 结果中有 lcsc_url 字段）
+  ├── 或用户提供 PDF 文件路径
+  └── Claude 下一步：
+      ├── 1. Read datasheets/C8734/index.md → 了解手册结构
+      ├── 2. 优先读取 🟢 标注的 PCB 相关章节
+      └── 3. 按需读取其他章节（引脚定义、参考电路等）
 
-④ 从 Markdown 中提取结构化信息
-  ├── 电源引脚：VCC/VDD 数量、电压范围、推荐去耦方案
-  ├── 关键外围：晶振频率+负载电容、复位电路、Boot 配置
-  ├── 通讯接口：I2C/SPI/UART 对应的引脚映射
+④ 从章节文件中提取结构化信息
+  ├── 先读 index.md → 定位需要的关键章节（🟢 标注优先）
+  ├── 电源引脚：Read 引脚描述 + 电气特性章节 → VCC/VDD 数量、电压范围、去耦方案
+  ├── 关键外围：Read 典型应用电路章节 → 晶振频率+负载电容、复位电路、Boot 配置
+  ├── 通讯接口：Read 引脚描述章节 → I2C/SPI/UART 对应的引脚映射
   └── 参考电路标注的外围器件值（R1=10K, C1=100nF ...）
 
 ⑤ 对每个外围器件，搜索 LCSC 有库存的具体型号
@@ -82,69 +78,80 @@
 
 ## 三、parse_datasheet.py 使用说明
 
-`parse_datasheet.py` 是自包含的 PDF 解析工具，无需额外配置 MCP 服务器。
+`parse_datasheet.py` 使用 **docling** 引擎将 PDF 转为 Markdown，按章节拆分为独立文件，并生成 `index.md` 目录索引。
 
 ### 依赖安装
 
 ```bash
-pip install "markitdown[pdf]"   # 默认后端（推荐，快速）
-pip install docling              # 可选后端（慢但表格质量高）
+pip install docling
 ```
+
+首次运行 docling 会从 Hugging Face Hub 下载模型（~770MB），需要网络代理。
 
 ### 基本用法
 
 ```bash
-# 解析 PDF + 提取关键章节（推荐）
-python tools/parse_datasheet.py ./datasheets/C8734.pdf --extract --format json
-
-# 仅全文 Markdown（不提取章节）
-python tools/parse_datasheet.py ./datasheets/C8734.pdf --format json
+# 完整流程：PDF → 章节文件 + index.md（推荐）
+python tools/parse_datasheet.py process ./datasheets/C8734.pdf --format json
 
 # 按 LCSC 编号自动找 PDF
-python tools/parse_datasheet.py --lcsc C8734 --extract --format json
+python tools/parse_datasheet.py process --lcsc C8734 --format json
 
 # 强制重新解析（忽略缓存）
-python tools/parse_datasheet.py C8734.pdf --extract --no-cache
+python tools/parse_datasheet.py process C8734.pdf --no-cache --format json
 
-# 指定后端
-python tools/parse_datasheet.py C8734.pdf --extract --backend docling
+# 仅解析 PDF → 全文 Markdown（保存缓存）
+python tools/parse_datasheet.py parse C8734.pdf --format json
 ```
 
 ### 输出结构
 
+```
+datasheets/C8734/
+├── index.md                         # 📋 完整目录 + 🟢 PCB 推荐阅读标注
+├── 01_1_introduction.md
+├── 02_2_description.md
+├── 03_3_pinouts_and_pin_description.md        # 🟢
+├── 05_5_electrical_characteristics.md         # 🟢
+├── 06_6_package_information.md                # 🟢
+├── 07_7_ordering_information_scheme.md
+└── 08_8_revision_history.md
+```
+
+**Claude 工作流：先读 `index.md` 了解手册结构 → 定位需要的章节 → 按需 `Read` 对应 .md 文件（几KB~几十KB）。**
+
+### JSON 输出
+
 ```json
 {
-  "pdf_path": "./datasheets/C8734.pdf",
-  "filename": "C8734.pdf",
-  "backend": "markitdown",
-  "page_count": 102,
-  "file_size_mb": 2.08,
-  "parse_time_s": 1.5,
+  "pdf_path": ".../datasheets/C8734.pdf",
+  "output_dir": ".../datasheets/C8734",
+  "index_file": ".../datasheets/C8734/index.md",
+  "page_count": 116,
+  "parse_time_s": 86.5,
   "cached": false,
-  "sections": {
-    "pinout": "## Pin Description\n\n| Pin | Name | ...",
-    "application_circuit": "## Typical Application\n...",
-    "electrical_characteristics": "## Electrical Characteristics\n...",
-    "absolute_maximum": "## Absolute Maximum Ratings\n...",
-    "layout_guidelines": "## Layout Guidelines\n...",
-    "package_info": "## Package Information\n..."
-  },
-  "sections_found": ["pinout", "application_circuit", "electrical_characteristics"],
-  "full_markdown": "...(全文 Markdown，前 80000 字符)"
+  "total_chapters": 8,
+  "pcd_relevant_count": 3,
+  "chapters": [
+    {"number": "03", "title": "Pinouts and pin description",
+     "file": "03_3_pinouts_and_pin_description.md",
+     "pcd_relevant": true, "relevance_reasons": ["pinout"]}
+  ]
 }
 ```
 
+### index.md 中的 🟢 标注
+
+PCB 设计相关章节会自动标注 🟢 并列入推荐阅读表。标注依据章节标题匹配以下关键词：
+- **引脚/管脚/端子** — Pinout
+- **电气特性/工作条件/极限参数** — Electrical
+- **PCB 布局/焊接/热设计** — Layout
+- **封装/外形尺寸/机械尺寸** — Package
+- **典型应用/参考设计** — Application
+
 ### 缓存机制
 
-解析后自动保存 `{pdf_name}.md` 到 PDF 同目录。下次解析同一 PDF 时自动读缓存，速度 < 0.1 秒。
-
-### 后端对比
-
-| 后端 | 安装 | 100页速度 | 表格质量 | 适用 |
-|------|------|-----------|----------|------|
-| markitdown | `pip install "markitdown[pdf]"` | ~1-3秒 | 一般 | 默认，适合大部分场景 |
-| docling | `pip install docling` | ~2-18分钟 | 优秀 | 需要精确表格数据时 |
-| pypdf | 内置 | <0.5秒 | 无 | 纯文本提取 / 兜底 |
+解析后自动保存 `{pdf_name}.md` 到 PDF 同目录（带 docling 元数据头）。下次解析同一 PDF 时自动读缓存，秒级命中。
 
 ---
 
