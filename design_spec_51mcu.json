@@ -1,0 +1,197 @@
+{
+  "meta": {
+    "version": "1.0",
+    "project_name": "51单片机最小系统板",
+    "created": "2026-06-14",
+    "source_datasheets": ["C8707"],
+    "source_chapters": [
+      "STC89/90系列技术手册 §3.4.9 LQFP44最小系统",
+      "STC89/90系列技术手册 §3.6 管脚说明",
+      "STC89/90系列技术手册 §5.1.2 复位电路",
+      "STC89/90系列技术手册 §25.6 外部晶振电路"
+    ],
+    "notes": "基于 Step 1 全链路验证的手册提取内容生成。C8707 PDF 28MB 中文手册，Docling 解析超时，改用 pdftotext + WebSearch 提取关键章节。"
+  },
+  "core_chips": [
+    {
+      "designator": "U2",
+      "name": "STC89C52RC-40I",
+      "lcsc": "C8707",
+      "package": "LQFP-44",
+      "pins": {
+        "power": [
+          {"number": 44, "name": "VCC", "net": "VCC+5V"}
+        ],
+        "ground": [
+          {"number": 22, "name": "GND"}
+        ],
+        "reset": [
+          {"number": 9, "name": "RST"}
+        ],
+        "crystal": [
+          {"number": 18, "name": "XTAL2"},
+          {"number": 19, "name": "XTAL1"}
+        ]
+      },
+      "excluded_pins": [
+        {
+          "number": 25,
+          "name": "PSEN#",
+          "reason": "外部程序存储使能（Program Store Enable），非芯片 Enable/复位引脚。无外部 ROM 时可浮空。ERC enable_pin 检查应将 PSEN 从 EN 引脚模式中排除。"
+        }
+      ]
+    },
+    {
+      "designator": "U1",
+      "name": "AMS1117-3.3",
+      "lcsc": "C6186",
+      "package": "SOT-223",
+      "pins": {
+        "power_input": [
+          {"number": 2, "name": "VIN", "net": "VCC+5V"}
+        ],
+        "power_output": [
+          {"number": 3, "name": "VOUT", "net": "+3.3V"}
+        ],
+        "ground": [
+          {"number": 1, "name": "GND"}
+        ]
+      }
+    }
+  ],
+  "requirements": [
+    {
+      "id": "decoupling_u2_vcc_pin44",
+      "category": "decoupling",
+      "severity": "error",
+      "description": "STC89C52RC Pin44 (MCU-VCC) 需 100nF 去耦电容，就近放置 (<5mm)，配合 10µF 大电容",
+      "rule": {
+        "target_chip": "U2",
+        "pin_pattern": "VCC|VDD",
+        "cap_value": "100nF",
+        "cap_value_f": 1e-7,
+        "tolerance": 0.2,
+        "placement": "near_pin",
+        "distance_mm": 5,
+        "notes": "手册 §3.4.9 LQFP44最小系统图显示 MCU-VCC 接 0.1µF 到 GND。建议组合：100nF (X7R/0603) + 10µF (大电容) 各一。"
+      },
+      "source": "STC89/90系列技术手册 §3.4.9 LQFP44最小系统示意图（90C版本）"
+    },
+    {
+      "id": "decoupling_u1_ams1117_vin",
+      "category": "decoupling",
+      "severity": "warning",
+      "description": "AMS1117-3.3 输入 Pin2 (VIN) 需 100nF 去耦 + 10µF 滤波电容",
+      "rule": {
+        "target_chip": "U1",
+        "pin_pattern": "VIN",
+        "cap_value": "100nF",
+        "cap_value_f": 1e-7,
+        "tolerance": 0.2,
+        "placement": "near_pin",
+        "distance_mm": 10,
+        "notes": "LDO 输入端标准做法：100nF 高频去耦 + 10µF 低频滤波。原理图中 C1=10µF 已存在，C2 值未标注可能为 100nF。"
+      },
+      "source": "AMS1117 数据手册典型应用电路（LDO 通用设计规范）"
+    },
+    {
+      "id": "pullup_rst_pin9",
+      "category": "pullup",
+      "severity": "warning",
+      "description": "RST 复位引脚 (Pin9) 传统设计需 10KΩ 上拉到 VCC，配合 10µF 电容到 GND",
+      "rule": {
+        "target_chip": "U2",
+        "pin_pattern": "RST",
+        "resistor_value": "10KΩ",
+        "resistor_ohm": 10000,
+        "pull_target": "VCC",
+        "notes": "手册 §5.1.2 说明：STC89C52RC 较新版本内置专业级复位电路，外部 RC 非必须。但传统设计中保留 R=10KΩ (C25804) + C=10µF (C15849) + 按键是兼容设计，不影响功能。如果不加外部复位电路，RST 可内部上拉。"
+      },
+      "source": "STC89/90系列技术手册 §5.1.2 复位电路参考设计"
+    },
+    {
+      "id": "crystal_load_12mhz_x1",
+      "category": "crystal",
+      "severity": "warning",
+      "description": "12MHz 晶振 X1 (C295072, HC-49S)：目标 CL≈20pF, Cstray≈3pF → C1=C2=34pF → 取标准值 33pF",
+      "rule": {
+        "target_chip": "U2",
+        "pin_pattern": "XTAL",
+        "frequency": "12MHz",
+        "load_cap_pf": 20.0,
+        "stray_cap_pf": 3.0,
+        "suggested_caps_pf": 33.0,
+        "confidence": "medium",
+        "notes": "手册 §25.6 仅给出典型值 22-33pF 范围，未针对 12MHz 指定精确 CL。20pF 为 12MHz 晶振常见 CL 值。实际需查阅 C295072 晶振规格书确认。当前原理图 C6=C7=47pF → CL_eff=26.5pF，若目标 CL=20pF 则偏差 +32.5%。"
+      },
+      "source": "STC89/90系列技术手册 §25.6 外部晶振电路；计算：C=2×(CL−Cstray)=2×(20−3)=34pF→E6=33pF"
+    },
+    {
+      "id": "termination_ea_vpp_high",
+      "category": "pin_termination",
+      "severity": "error",
+      "description": "EA/VPP (Pin31) 必须接高电平 (VCC) 才能从内部 Flash 执行程序",
+      "rule": {
+        "target_chip": "U2",
+        "pin_pattern": "EA",
+        "termination": "pullup_to_vcc",
+        "notes": "EA=1: 从内部程序存储器执行（正常模式）。EA=0: 从外部程序存储器执行。51 最小系统无外部 ROM，EA 必须接 VCC。若 EA 浮空 → MCU 无法启动。"
+      },
+      "source": "STC89/90系列技术手册 §3.6 管脚说明 — EA/P4.5：内部/外部程序存储器选择"
+    },
+    {
+      "id": "termination_p0_port_pullup",
+      "category": "pin_termination",
+      "severity": "warning",
+      "description": "P0 口 (P0.0-P0.7) 作为通用 I/O 时需外接 10KΩ-4.7KΩ 上拉电阻到 VCC",
+      "rule": {
+        "target_chip": "U2",
+        "pin_pattern": "P0\\.",
+        "termination": "pullup_to_vcc",
+        "resistor_value": "10KΩ",
+        "resistor_ohm": 10000,
+        "notes": "P0 口上电复位后处于开漏模式，内部无上拉电阻。作为 I/O 口使用时必须外接上拉。若 P0 口仅用作地址/数据总线（扩展外部 RAM/ROM 时），则不需上拉。样本工程中 P0 通过排针 H6 引出，如用作普通 I/O 需确保有外部上拉。"
+      },
+      "source": "STC89/90系列技术手册 §3.6 管脚说明 — P0 口特性：开漏输出，需外接上拉"
+    },
+    {
+      "id": "exclude_psen_from_enable_pin",
+      "category": "pin_exclusion",
+      "severity": "suggestion",
+      "description": "PSEN# (Pin25) 从 enable_pin 检查中排除 — 非芯片 Enable/复位引脚",
+      "rule": {
+        "target_chip": "U2",
+        "pin_pattern": "PSEN",
+        "exclude_from_checks": ["enable_pin"],
+        "reason": "PSEN (Program Store Enable) 是 8051 外部程序存储器读选通信号，非芯片 Enable/复位引脚。名称含 'EN' 子串导致 ERC enable_pin 检查误报。无外部 ROM 时 PSEN 可浮空。"
+      },
+      "source": "STC89/90系列技术手册 §3.6 管脚说明 — PSEN/P4.4：外部 ROM 选通"
+    },
+    {
+      "id": "power_feedback_ams1117_fixed",
+      "category": "power_feedback",
+      "severity": "suggestion",
+      "description": "AMS1117-3.3 固定输出 LDO，内部集成反馈电阻，无需外部反馈分压网络",
+      "rule": {
+        "target_chip": "U1",
+        "vref": 1.25,
+        "target_vout": 3.3,
+        "notes": "fixed_output — AMS1117-3.3 尾缀 -3.3 表示固定 3.3V 输出版本。Vout = 1.25×(1+R1/R2) 由内部激光修调电阻实现，用户不可调。FB/ADJ 引脚不存在，ERC feedback_divider 检查应跳过此芯片。"
+      },
+      "source": "AMS1117 数据手册 — 固定输出版本 vs ADJ 可调版本的区别"
+    },
+    {
+      "id": "termination_rd_wr_unused",
+      "category": "pin_termination",
+      "severity": "suggestion",
+      "description": "RD# (Pin14) 和 WR# (Pin15) 无外部 RAM 时可浮空",
+      "rule": {
+        "target_chip": "U2",
+        "pin_pattern": "RD|WR",
+        "termination": "must_float",
+        "notes": "RD#/WR# 是外部数据存储器读写选通信号。51 最小系统无外部 RAM 时这两个引脚不需要连接。浮空不导致问题（内部弱上拉）。"
+      },
+      "source": "STC89/90系列技术手册 §3.6 管脚说明 — RD/P3.7, WR/P3.6"
+    }
+  ]
+}

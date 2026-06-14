@@ -45,6 +45,12 @@
       "command": "python jlc-eda-companion/tools/phase2_erc_check.py",
       "description": "ERC 电气规则检查引擎（7项）：去耦电容、EN/复位上下拉、I2C上拉、反馈分压、晶振电容、悬空引脚、电源短路",
       "args": ["--stdin"]
+    },
+    {
+      "name": "design_spec",
+      "command": "python jlc-eda-companion/tools/design_spec.py",
+      "description": "Design Spec 管理工具（Phase 1→2 桥梁）：校验结构化设计规约 JSON，从模板初始化，列出需求类别",
+      "args": ["--format", "json"]
     }
   ],
   "prompts": {
@@ -66,7 +72,14 @@
                     "去耦电容", "上拉电阻", "I2C上拉", "反馈电阻", "晶振电容",
                     "悬空引脚", "电源短路", "浮空", ".eprj2", ".epro2", "工程文件",
                     "提取网表", "网表", "netlist"],
-      "description": "解析嘉立创EDA工程→提取网表→7项ERC检查→对照数据手册生成审查报告"
+      "description": "解析嘉立创EDA工程→提取网表→7项ERC检查→对照Design Spec生成审查报告"
+    },
+    "1-2": {
+      "name": "Design Spec 生成（Phase 1→2 桥梁）",
+      "role": "bridge",
+      "triggers": ["design spec", "设计规约", "设计规范", "spec.json", "spec文件",
+                    "生成spec", "提取设计规约", "结构化需求"],
+      "description": "将Phase 1提取的数据手册知识转换为结构化Design Spec JSON，供Phase 2 ERC引擎精确对照检查"
     }
   },
   "requires_mcp": []

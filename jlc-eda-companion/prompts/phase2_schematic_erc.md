@@ -209,9 +209,42 @@ ERC 检查基于启发式规则，可能产生误报：
 
 ---
 
-## 五、与阶段一的衔接
+## 五、与阶段一的衔接（Design Spec）
 
-Phase 1 生成的 BOM 报告包含外围器件推荐值，Phase 2 ERC 可以：
+Phase 1 生成的 **Design Spec JSON** 包含手册的结构化要求。Phase 2 ERC 可通过 `--spec` 参数消费：
+
+```bash
+# Step 3+ (即将实现): 带 Design Spec 的精确 ERC
+python tools/phase2_erc_check.py netlist.json --spec design_spec.json
+```
+
+### Design Spec 驱动的精确检查（vs 通用规则）
+
+| 通用规则（当前） | Design Spec 驱动（Step 3） |
+|-----------------|-------------------------|
+| "IC VCC 有 100nF 电容?" | "手册 §3.4.9 要求 U2 Pin44 有 100nF 去耦，实际检测: 无 ❌" |
+| "晶振有负载电容?" | "手册 §25.6 要求 CL=20pF，实际 CLeff=26.5pF，偏差+32.5% ⚠️" |
+| "EN 脚浮空?" | "NRST: 手册 §5.1.2 要求 10K 上拉 VCC，实际已接 ✅" |
+
+### 手动交叉参考（Design Spec 未接入前）
+
+在 Step 3 完成前，Claude 可手动执行交叉对比：
+
+```
+① 读取 Phase 1 生成的 design_spec.json
+② 逐条 requirement 对照 ERC 报告中的发现
+③ 区分：
+   - ✅ 真问题 — 手册要求 X，实际原理图违反 X
+   - ❌ 误报 — ERC 发现 Y，但手册明确定义 Y 的例外情况
+   - ⚠️ 待确认 — 手册信息不完整，需查晶振/电阻自身规格书
+   - 💡 低风险 — 优化建议，不修也能工作
+```
+
+### pin_exclusion 优先级最高
+
+如果 Design Spec 包含 `pin_exclusion` 类别，这些排除规则应在所有其他检查之前应用，避免已知误报（如 PSEN# 被误判为 EN 引脚）。
+
+## 六、与阶段一的衔接（BOM）
 
 1. **对比推荐值 vs 实际值**：
    - Phase 1 BOM: "C1-C4: 100nF 去耦电容"
@@ -229,7 +262,7 @@ Phase 1 生成的 BOM 报告包含外围器件推荐值，Phase 2 ERC 可以：
 
 ---
 
-## 六、设计限制与已知局限
+## 七、设计限制与已知局限
 
 1. **引脚数量推断**：基于元件位号/名称启发式推断（非从 symbol 文件精确读取）
 2. **引脚名称推断**：网络名称代表引脚功能（如 `RXD` 网络 → MCU 的 RXD 引脚），非 symbol 文件中的精确引脚名
