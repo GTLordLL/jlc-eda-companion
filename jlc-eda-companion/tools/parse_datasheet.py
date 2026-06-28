@@ -51,6 +51,12 @@ SKIP_HEADING_PATTERNS = [
     re.compile(r'^where:?\s*$', re.IGNORECASE),
 ]
 
+# ── Batching Constants ──────────────────────────────────────────────────
+
+DEFAULT_BATCH_SIZE = 100
+AUTO_BATCH_THRESHOLD = 200  # PDF 超过此页数自动分批处理
+
+
 # ── PCB Relevance Keywords ────────────────────────────────────────────
 
 PCB_KEYWORD_GROUPS: dict[str, list[str]] = {
@@ -116,11 +122,19 @@ def slugify(title: str, max_length: int = 60) -> str:
 
 # ── PDF Parsing (docling) ──────────────────────────────────────────────
 
-def _parse_with_docling(pdf_path: str) -> str:
+def _parse_with_docling(
+    pdf_path: str,
+    page_range: Optional[tuple[int, int]] = None,
+    max_pages: Optional[int] = None,
+    low_memory: bool = False,
+) -> str:
     """Convert a PDF to Markdown using docling.
 
     Args:
         pdf_path: Absolute or relative path to the PDF file.
+        page_range: Optional (start, end) 1-indexed inclusive page range.
+        max_pages: Optional maximum number of pages to process.
+        low_memory: If True, disable OCR and table detection to save memory.
 
     Returns:
         Markdown text.
@@ -129,11 +143,151 @@ def _parse_with_docling(pdf_path: str) -> str:
         ImportError: If docling is not installed.
         Exception: On docling parse failure.
     """
-    from docling.document_converter import DocumentConverter
+    from docling.document_converter import DocumentConverter, InputFormat, PdfFormatOption
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
 
-    converter = DocumentConverter()
-    result = converter.convert(pdf_path)
+    # Configure pipeline options
+    pipeline_opts = PdfPipelineOptions()
+
+    if low_memory:
+        pipeline_opts.do_ocr = False
+        pipeline_opts.do_table_structure = False
+        pipeline_opts.ocr_batch_size = 1
+        pipeline_opts.layout_batch_size = 1
+        pipeline_opts.table_batch_size = 1
+        pipeline_opts.images_scale = 0.5  # Lower resolution → less memory
+
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_opts)
+        }
+    )
+
+    # Compute effective page_range
+    kwargs: dict = {}
+    if page_range is not None:
+        kwargs["page_range"] = page_range
+    elif max_pages is not None:
+        kwargs["page_range"] = (1, max_pages)
+
+    result = converter.convert(pdf_path, **kwargs)
     return result.document.export_to_markdown()
+
+
+def _parse_with_docling_batched(
+    pdf_path: str,
+    total_pages: int,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    low_memory: bool = False,
+) -> str:
+    """Process a large PDF in batches to avoid unbounded image cache OOM.
+
+    Each batch calls :func:`_parse_with_docling` with a limited ``page_range``.
+    The docling image cache is freed between batches by ``gc.collect()``.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        total_pages: Total page count (from pdfplumber).
+        batch_size: Pages per batch (default 100).
+        low_memory: Passed through to ``_parse_with_docling``.
+
+    Returns:
+        Combined Markdown text from all batches.
+    """
+    import gc
+
+    num_batches = (total_pages + batch_size - 1) // batch_size
+    parts: list[str] = []
+
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * batch_size + 1
+        batch_end = min(batch_start + batch_size - 1, total_pages)
+
+        print(
+            f"   📦 批次 {batch_idx + 1}/{num_batches}: "
+            f"第 {batch_start}–{batch_end} 页 (共 {total_pages} 页) ...",
+            file=sys.stderr,
+        )
+
+        try:
+            md = _parse_with_docling(
+                pdf_path,
+                page_range=(batch_start, batch_end),
+                low_memory=low_memory,
+            )
+            parts.append(md)
+        except Exception as e:
+            print(
+                f"   ⚠️  批次 {batch_idx + 1} 失败 ({e})，跳过",
+                file=sys.stderr,
+            )
+            # Continue with remaining batches — don't lose everything
+            # because one batch failed
+
+        gc.collect()
+
+    if not parts:
+        raise RuntimeError(
+            f"所有 {num_batches} 个批次均解析失败，无法生成任何内容"
+        )
+
+    print(
+        f"   ✅ 分批解析完成：{len(parts)}/{num_batches} 批次成功",
+        file=sys.stderr,
+    )
+
+    return "\n\n".join(parts)
+
+
+def _parse_with_pdfplumber(
+    pdf_path: str,
+    page_range: Optional[tuple[int, int]] = None,
+    max_pages: Optional[int] = None,
+) -> str:
+    """Lightweight text extraction using pdfplumber (no ML models, no bitmaps).
+
+    Best for text-heavy PDFs where OCR / table detection are unnecessary.
+    Processes hundreds of pages per second with minimal memory.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        page_range: Optional (start, end) 1-indexed inclusive range.
+        max_pages: Optional maximum pages.
+
+    Returns:
+        Plain-text Markdown with ``## Page N`` delimiters.
+
+    Raises:
+        ImportError: If pdfplumber is not installed.
+    """
+    import pdfplumber
+
+    # Determine page range
+    start = 1
+    with pdfplumber.open(pdf_path) as pdf:
+        total = len(pdf.pages)
+        end = total
+
+        if page_range:
+            start, user_end = page_range
+            end = min(user_end, total)
+        elif max_pages:
+            end = min(max_pages, total)
+
+        start = max(1, start)
+        end = max(start, end)
+
+        lines_out: list[str] = []
+        for pg_num in range(start, end + 1):
+            page = pdf.pages[pg_num - 1]
+            text = page.extract_text()
+            lines_out.append(f"## Page {pg_num}\n")
+            if text:
+                lines_out.append(text)
+            else:
+                lines_out.append("*(此页无可提取文本)*")
+
+        return "\n\n".join(lines_out)
 
 
 def _get_page_count(pdf_path: str) -> Optional[int]:
@@ -146,16 +300,32 @@ def _get_page_count(pdf_path: str) -> Optional[int]:
         return None
 
 
-def parse_pdf(pdf_path: str, no_cache: bool = False) -> dict:
+def parse_pdf(
+    pdf_path: str,
+    no_cache: bool = False,
+    page_range: Optional[tuple[int, int]] = None,
+    max_pages: Optional[int] = None,
+    low_memory: bool = False,
+    text_only: bool = False,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> dict:
     """Parse a PDF to full Markdown using docling, with caching.
 
     Cache is saved as ``{pdf_name}.md`` alongside the PDF.
     A header line identifies the cache as docling-generated; old markitdown
     caches (without the header) are automatically invalidated.
 
+    For PDFs over ``AUTO_BATCH_THRESHOLD`` pages (default 200), processing is
+    automatically split into batches to avoid memory overflow.
+
     Args:
         pdf_path: Path to the PDF file.
         no_cache: If True, delete and recreate the cache.
+        page_range: Optional (start, end) 1-indexed inclusive page range.
+        max_pages: Optional maximum number of pages to process.
+        low_memory: If True, disable OCR and table detection.
+        text_only: If True, use pdfplumber for lightweight text extraction.
+        batch_size: Pages per batch when auto-batching (default 100).
 
     Returns:
         {
@@ -187,36 +357,102 @@ def parse_pdf(pdf_path: str, no_cache: bool = False) -> dict:
     cache_path = str(Path(pdf_path).with_suffix(".md"))
     result["cache_path"] = cache_path
 
-    # Invalidate cache if requested
-    if no_cache and os.path.exists(cache_path):
+    # Invalidate cache if requested (but only when no range filter is active —
+    # a range-filtered parse creates a partial markdown that shouldn't
+    # invalidate a full-parse cache).
+    if no_cache and os.path.exists(cache_path) and not page_range and not max_pages:
         try:
             os.remove(cache_path)
         except OSError:
             pass
 
-    # Try cache hit
-    pdf_mtime = os.path.getmtime(pdf_path)
-    if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= pdf_mtime:
-        try:
-            cached_text = Path(cache_path).read_text(encoding="utf-8")
-            # Check for docling cache header
-            first_line = cached_text.split("\n", 1)[0].strip()
-            m = CACHE_HEADER_RE.match(first_line)
-            if m and m.group(1) == "docling":
-                result["markdown"] = cached_text
-                result["cached"] = True
-                result["parse_time_s"] = 0.0
-                # Still get page count if possible
-                result["page_count"] = _get_page_count(pdf_path)
-                return result
-            # Old cache (markitdown or no header) — ignore, re-parse
-        except Exception:
-            pass  # Corrupt cache — re-parse
+    # Try cache hit (only when not using page_range — range-filtered parses
+    # should not read the full-parse cache)
+    if not page_range and not max_pages:
+        pdf_mtime = os.path.getmtime(pdf_path)
+        if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= pdf_mtime:
+            try:
+                cached_text = Path(cache_path).read_text(encoding="utf-8")
+                # Check for docling cache header
+                first_line = cached_text.split("\n", 1)[0].strip()
+                m = CACHE_HEADER_RE.match(first_line)
+                if m and m.group(1) == "docling":
+                    result["markdown"] = cached_text
+                    result["cached"] = True
+                    result["parse_time_s"] = 0.0
+                    # Still get page count if possible
+                    result["page_count"] = _get_page_count(pdf_path)
+                    return result
+                # Old cache (markitdown or no header) — ignore, re-parse
+            except Exception:
+                pass  # Corrupt cache — re-parse
 
-    # Parse with docling
+    # ── Determine parsing strategy ──────────────────────────────────────
+
+    total_pages = _get_page_count(pdf_path)  # None if pdfplumber unavailable
+
+    # Strategy 1: text_only — use pdfplumber, no ML
+    if text_only:
+        t0 = time.time()
+        try:
+            markdown = _parse_with_pdfplumber(
+                pdf_path, page_range=page_range, max_pages=max_pages
+            )
+        except ImportError as e:
+            result["error"] = f"pdfplumber 未安装。请运行: pip install pdfplumber\n原始错误: {e}"
+            return result
+        except Exception as e:
+            result["error"] = f"pdfplumber 文本提取失败: {e}"
+            return result
+        elapsed = time.time() - t0
+        result["parse_time_s"] = round(elapsed, 3)
+        result["page_count"] = total_pages
+        result["markdown"] = markdown
+        # Don't cache text-only results (they're cheap to regenerate)
+        return result
+
+    # Strategy 2: docling with (optional) auto-batching
     t0 = time.time()
+    use_batching = False
+
+    if page_range:
+        # User-specified range — single call, no batching
+        effective_range = page_range
+    elif max_pages:
+        effective_range = (1, max_pages)
+    elif (
+        total_pages is not None
+        and total_pages > AUTO_BATCH_THRESHOLD
+        and batch_size > 0
+    ):
+        # Auto-batch for large PDFs
+        use_batching = True
+    else:
+        # Small PDF — single call
+        effective_range = None
+
     try:
-        markdown = _parse_with_docling(pdf_path)
+        if use_batching:
+            print(
+                f"   🔄 PDF 共 {total_pages} 页，"
+                f"自动分批处理（每批 {batch_size} 页）...",
+                file=sys.stderr,
+            )
+            markdown = _parse_with_docling_batched(
+                pdf_path,
+                total_pages=total_pages,
+                batch_size=batch_size,
+                low_memory=low_memory,
+            )
+        else:
+            markdown = _parse_with_docling(
+                pdf_path,
+                page_range=effective_range if (
+                    page_range is not None or max_pages is not None
+                ) else None,
+                max_pages=None,  # already folded into effective_range
+                low_memory=low_memory,
+            )
     except ImportError as e:
         result["error"] = f"docling 未安装。请运行: pip install docling\n原始错误: {e}"
         return result
@@ -227,21 +463,25 @@ def parse_pdf(pdf_path: str, no_cache: bool = False) -> dict:
     elapsed = time.time() - t0
     result["parse_time_s"] = round(elapsed, 3)
 
-    # Prepend cache header
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-    pdf_basename = os.path.basename(pdf_path)
-    header = f"<!-- jlc-datasheet-cache backend=docling pdf={pdf_basename} timestamp={timestamp} -->\n"
-    markdown = header + markdown
+    # Prepend cache header (only cache full parses, not range-filtered)
+    if not page_range and not max_pages:
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        pdf_basename = os.path.basename(pdf_path)
+        header = (
+            f"<!-- jlc-datasheet-cache backend=docling "
+            f"pdf={pdf_basename} timestamp={timestamp} -->\n"
+        )
+        markdown = header + markdown
 
-    # Write cache
-    try:
-        Path(cache_path).write_text(markdown, encoding="utf-8")
-    except OSError:
-        pass  # Non-fatal
+        # Write cache
+        try:
+            Path(cache_path).write_text(markdown, encoding="utf-8")
+        except OSError:
+            pass  # Non-fatal
 
     result["markdown"] = markdown
     result["cached"] = False
-    result["page_count"] = _get_page_count(pdf_path)
+    result["page_count"] = total_pages
 
     return result
 
@@ -661,7 +901,7 @@ def write_index(
         lines.append(f"> **Pages:** {page_count}")
     if file_size:
         lines.append(f"> **Size:** {file_size} MB")
-    lines.append(f"> **Parsed with:** docling")
+    lines.append(f"> **Parsed with:** {metadata.get('backend', 'docling')}")
     lines.append(f"> **Generated:** {generated}")
     lines.append("")
 
@@ -728,14 +968,27 @@ def process_datasheet(
     pdf_path: str,
     output_dir: Optional[str] = None,
     no_cache: bool = False,
+    page_range: Optional[tuple[int, int]] = None,
+    max_pages: Optional[int] = None,
+    low_memory: bool = False,
+    text_only: bool = False,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict:
     """Run the full pipeline: parse PDF → detect chapters → split → write index.
+
+    For PDFs over ``AUTO_BATCH_THRESHOLD`` pages (default 200), docling parsing
+    is automatically split into batches to avoid memory overflow.
 
     Args:
         pdf_path: Path to the PDF file.
         output_dir: Directory for chapter files + index.md.
                     Defaults to ``datasheets/{pdf_stem}/`` alongside the PDF.
         no_cache: If True, force re-parse.
+        page_range: Optional (start, end) 1-indexed inclusive page range.
+        max_pages: Optional maximum number of pages to process.
+        low_memory: If True, disable OCR and table detection.
+        text_only: If True, use pdfplumber for lightweight text extraction.
+        batch_size: Pages per batch when auto-batching (default 100).
 
     Returns:
         {
@@ -766,7 +1019,15 @@ def process_datasheet(
         file_size_mb = None
 
     # Step 1: Parse PDF
-    parse_result = parse_pdf(pdf_path, no_cache=no_cache)
+    parse_result = parse_pdf(
+        pdf_path,
+        no_cache=no_cache,
+        page_range=page_range,
+        max_pages=max_pages,
+        low_memory=low_memory,
+        text_only=text_only,
+        batch_size=batch_size,
+    )
     if parse_result["error"]:
         return {
             "pdf_path": pdf_path,
@@ -818,6 +1079,7 @@ def process_datasheet(
         "page_count": parse_result["page_count"],
         "file_size_mb": file_size_mb,
         "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "backend": "pdfplumber" if text_only else "docling",
     }
     index_file = write_index(split_result["chapters"], output_dir, metadata)
 
@@ -989,6 +1251,45 @@ def _resolve_files(
 
 # ── CLI ────────────────────────────────────────────────────────────────
 
+def _parse_page_range_arg(raw: str) -> tuple[int, int]:
+    """Parse a ``--pages`` argument like ``1-100`` or ``1,100``.
+
+    Returns (start, end) 1-indexed inclusive.  Exit with code 2 on bad format.
+    """
+    sep = "-" if "-" in raw else ","
+    parts = raw.split(sep)
+    if len(parts) != 2:
+        print(
+            json.dumps(
+                {"error": f"无效的页码范围格式: {raw!r}（期望: START-END 或 START,END）"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        start, end = int(parts[0].strip()), int(parts[1].strip())
+    except ValueError:
+        print(
+            json.dumps(
+                {"error": f"页码范围必须为数字: {raw!r}"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if start < 1 or end < start:
+        print(
+            json.dumps(
+                {"error": f"无效范围: start={start}, end={end}（start >= 1, end >= start）"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return (start, end)
+
+
 def _add_common_args(p: argparse.ArgumentParser) -> None:
     """Add --format argument shared across all subcommands."""
     p.add_argument(
@@ -1006,6 +1307,11 @@ def _build_parser() -> argparse.ArgumentParser:
   python parse_datasheet.py process C8734.pdf                     # 完整流程
   python parse_datasheet.py process C8734.pdf --format json       # JSON 输出
   python parse_datasheet.py process C8734.pdf --output-dir ./out  # 指定输出目录
+  python parse_datasheet.py process C8734.pdf --pages 1-100       # 只处理前100页
+  python parse_datasheet.py process C8734.pdf --max-pages 50      # 最多处理50页（快速预览）
+  python parse_datasheet.py process C8734.pdf --low-memory        # 低内存模式（关闭OCR）
+  python parse_datasheet.py process C8734.pdf --text-only         # 纯文本模式（最快）
+  python parse_datasheet.py process C8734.pdf --batch-size 50     # 自定义分批大小
   python parse_datasheet.py parse C8734.pdf                       # 仅解析 PDF
   python parse_datasheet.py split C8734.md --output-dir ./out     # 仅拆分 Markdown
   python parse_datasheet.py --lcsc C8734                          # 按 LCSC 编号查找
@@ -1054,6 +1360,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-cache", action="store_true",
         help="强制重新解析（忽略缓存）",
     )
+    p_process.add_argument(
+        "--pages", metavar="START-END",
+        help="只处理指定页码范围，如 --pages 1-100（1-indexed，包含边界）",
+    )
+    p_process.add_argument(
+        "--max-pages", metavar="N", type=int,
+        help="最多处理 N 页（快速预览前 N 页）",
+    )
+    p_process.add_argument(
+        "--low-memory", action="store_true",
+        help="低内存模式：关闭 OCR 和表格检测，降低内存消耗",
+    )
+    p_process.add_argument(
+        "--text-only", action="store_true",
+        help="纯文本模式：使用 pdfplumber 轻量提取（零 ML 模型，最快速度）",
+    )
+    p_process.add_argument(
+        "--batch-size", metavar="N", type=int, default=DEFAULT_BATCH_SIZE,
+        help=f"分批大小（默认 {DEFAULT_BATCH_SIZE} 页/批）",
+    )
 
     # parse
     p_parse = subparsers.add_parser(
@@ -1067,6 +1393,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p_parse.add_argument(
         "--no-cache", action="store_true",
         help="强制重新解析",
+    )
+    p_parse.add_argument(
+        "--pages", metavar="START-END",
+        help="只处理指定页码范围，如 --pages 1-100",
+    )
+    p_parse.add_argument(
+        "--max-pages", metavar="N", type=int,
+        help="最多处理 N 页",
+    )
+    p_parse.add_argument(
+        "--low-memory", action="store_true",
+        help="低内存模式：关闭 OCR 和表格检测",
+    )
+    p_parse.add_argument(
+        "--text-only", action="store_true",
+        help="纯文本模式：使用 pdfplumber 轻量提取",
     )
 
     # split
@@ -1101,6 +1443,10 @@ def main() -> None:
                 datasheet_dir,
             )
 
+            # Parse --pages range if provided
+            pages_raw = getattr(args, 'pages', None)
+            page_range = _parse_page_range_arg(pages_raw) if pages_raw else None
+
             results = []
             for pdf_path in pdf_paths:
                 output_dir = getattr(args, 'output_dir', None) or None
@@ -1108,6 +1454,11 @@ def main() -> None:
                     pdf_path,
                     output_dir=output_dir,
                     no_cache=getattr(args, 'no_cache', False),
+                    page_range=page_range,
+                    max_pages=getattr(args, 'max_pages', None),
+                    low_memory=getattr(args, 'low_memory', False),
+                    text_only=getattr(args, 'text_only', False),
+                    batch_size=getattr(args, 'batch_size', DEFAULT_BATCH_SIZE),
                 )
                 results.append(result)
 
@@ -1121,7 +1472,16 @@ def main() -> None:
                         print("")
 
         elif args.mode == "parse":
-            result = parse_pdf(args.pdf_path, no_cache=args.no_cache)
+            pages_raw = getattr(args, 'pages', None)
+            page_range = _parse_page_range_arg(pages_raw) if pages_raw else None
+            result = parse_pdf(
+                args.pdf_path,
+                no_cache=args.no_cache,
+                page_range=page_range,
+                max_pages=getattr(args, 'max_pages', None),
+                low_memory=getattr(args, 'low_memory', False),
+                text_only=getattr(args, 'text_only', False),
+            )
             # Add markdown_length for display (don't embed full markdown in output)
             if result.get("markdown"):
                 result["markdown_length"] = len(result["markdown"])
@@ -1154,6 +1514,7 @@ def main() -> None:
                 "page_count": None,
                 "file_size_mb": None,
                 "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "backend": "docling",
             }
             index_file = write_index(split_result["chapters"], args.output_dir, metadata)
 
