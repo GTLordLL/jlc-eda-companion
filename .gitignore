@@ -1,0 +1,30 @@
+# Python virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Datasheet cache (downloadable PDFs + parse cache)
+datasheets/
+samples/
+specs/
+
+# External EEXT demos (not part of the skill)
+eext-easyeda-api-agent/
+eext-external-tool-integration-demo/
+eext-generate-schematic-from-netlist/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
