@@ -11,38 +11,45 @@
 | **一：解决方案生成** | 🟩 主动引导 + 辅助 | 需求澄清 → 芯片选型(LCSC搜索) → 数据手册下载与解析 → 外围电路BOM生成 |
 | **二：原理图审查** | 🟨 审查/Linter | 解析嘉立创 EDA 原理图 → 提取网表 → 对照芯片手册做电气规则检查（ERC） |
 
-> 阶段三～五（PCB诊断、可制造性、调试）为远期规划，详见 `intro/design/Skill设计文档.md`。
+> 阶段三～五（PCB诊断、可制造性、调试）为远期规划，详见 `docs/design/Skill设计文档.md`。
 
 ## 仓库结构
 
 ```
-jialichuang_eda_skill/
+jialichuang_eda_skill/                      ← 项目根
 ├── CLAUDE.md                              # 本文件
-├── intro/                                 # 项目文档与分析
-│   └── design/
-│       ├── PCB设计流程(初级).md             # PCB 设计流程参考
-│       ├── 嘉立创EDA工程文件格式分析.md      # 工程文件格式逆向分析
-│       ├── Skill设计文档.md                # Skill 架构设计（五阶段总览）
-│       └── parse/                         # 各阶段详细设计
-│           ├── phase1_solution_generation.md  # 阶段一设计
-│           ├── phase2_schematic_erc.md        # 阶段二设计
-│           ├── phase3_pcb_drc.md              # [远期] 阶段三
-│           ├── phase4_manufacturing_bom.md    # [远期] 阶段四
-│           └── phase5_debug.md               # [远期] 阶段五
+├── jlc-eda-companion/                     # ⭐ Skill 源代码
+│   ├── skill.json                         # Skill 总控（描述、触发词、工具注册）
+│   ├── prompts/                           # Claude 行为指引
+│   │   ├── phase1_solution_generation.md    # 阶段一：解决方案生成
+│   │   └── phase2_schematic_erc.md          # 阶段二：原理图 ERC 审查
+│   └── tools/                             # Python 工具脚本
+│       ├── search_lcsc.py                 # ✅ LCSC 元器件搜索
+│       ├── fetch_datasheet.py             # ✅ 数据手册 PDF 下载
+│       ├── parse_datasheet.py             # ✅ PDF → Markdown 解析 + 章节提取
+│       ├── compute_passive.py             # ✅ 阻容值计算器
+│       ├── parse_jlc_project.py           # 📋 统一工程解析器（3 种格式）
+│       ├── extract_netlist.py             # 📋 网表提取（WIRE 拓扑 → 网络连接）
+│       ├── phase2_erc_check.py            # 📋 ERC 检查引擎
+│       ├── phase2_action_gen.py           # 📋 ERC 修复建议生成
+│       └── design_spec.py                 # 📋 Design Spec 管理
+├── docs/                                  # 项目文档
+│   ├── design/                            # 架构设计文档
+│   │   ├── PCB设计流程(初级).md             # PCB 设计流程参考
+│   │   ├── 嘉立创EDA工程文件格式分析.md      # 工程文件格式逆向分析
+│   │   ├── Skill设计文档.md                # Skill 架构设计（五阶段总览）
+│   │   ├── mvp计划.md                      # MVP 开发计划
+│   │   └── parse/                         # 各阶段详细设计
+│   │       ├── phase1_solution_generation.md
+│   │       ├── phase2_schematic_erc.md
+│   │       ├── phase3_pcb_drc.md
+│   │       ├── phase4_manufacturing_bom.md
+│   │       └── phase5_debug.md
+│   └── 讨论.md                             # 讨论记录
 ├── jlc_project/                           # 样本工程（测试用）
+├── design_spec_51mcu.json                 # 51 单片机 Design Spec 样例
 ├── datasheets/                            # 下载的数据手册 PDF 缓存
-└── jlc-eda-companion/                     # ⭐ Skill 源代码
-    ├── skill.json                         # Skill 总控（描述、触发词、工具注册）
-    ├── prompts/                           # Claude 行为指引
-    │   └── phase1_solution_generation.md    # 阶段一：解决方案生成
-    └── tools/                             # Python 工具脚本
-        ├── search_lcsc.py                 # ✅ LCSC 元器件搜索
-        ├── fetch_datasheet.py             # ✅ 数据手册 PDF 下载
-        ├── parse_datasheet.py             # ✅ PDF → Markdown 解析 + 章节提取
-        ├── compute_passive.py             # ✅ 阻容值计算器
-        ├── parse_jlc_project.py           # 📋 统一工程解析器（3 种格式）
-        ├── extract_netlist.py             # 📋 网表提取（WIRE 拓扑 → 网络连接）
-        └── phase2_erc_check.py            # 📋 ERC 检查引擎
+└── requirements.txt                       # Python 依赖
 ```
 
 > ✅ = 已实现　　📋 = 阶段二待开发
@@ -73,10 +80,10 @@ prompts/phase2_erc_rules.md  ← Claude 审查行为指引
 
 ## 关键技术与接口
 
-- **嘉立创 EDA 工程格式**：详见 `intro/design/嘉立创EDA工程文件格式分析.md`
-- **Skill 架构设计**：详见 `intro/design/Skill设计文档.md`
+- **嘉立创 EDA 工程格式**：详见 `docs/design/嘉立创EDA工程文件格式分析.md`
+- **Skill 架构设计**：详见 `docs/design/Skill设计文档.md`
 - **立创商城 API**：LCSC 元器件搜索与库存查询
-- **数据手册解析**：markitdown 引擎（自包含，无需外部 MCP）
+- **数据手册解析**：docling 引擎（自包含，无需外部 MCP）
 
 ## 样本工程速查
 
@@ -87,5 +94,5 @@ prompts/phase2_erc_rules.md  ← Claude 审查行为指引
 
 ## 运行须知
 
-1. 运行 Python 前先 `source .venv/bin/activate`
+1. 运行 Python 前先 `source .venv/Scripts/activate`（Windows）或 `source .venv/bin/activate`（Linux）
 2. 访问国外网站使用代理 `7897`

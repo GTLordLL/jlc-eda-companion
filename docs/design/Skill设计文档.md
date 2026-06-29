@@ -54,7 +54,7 @@ Layer 3: 报告层 (Report Layer) —— 统一输出格式
 ```
 jialichuang_eda_skill/
 ├── CLAUDE.md
-├── intro/design/
+├── docs/design/
 │   ├── PCB设计流程(初级).md
 │   ├── 讨论.md
 │   ├── 嘉立创EDA工程文件格式分析.md
