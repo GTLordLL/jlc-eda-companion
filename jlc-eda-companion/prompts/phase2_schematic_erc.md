@@ -153,6 +153,9 @@ python tools/phase2_erc_check.py netlist.json --check decoupling_cap,floating_pi
 
 # JSON 输出
 python tools/phase2_erc_check.py netlist.json --format json
+
+# 带可执行修复建议（含 LCSC 推荐）
+python tools/phase2_erc_check.py netlist.json --spec design_spec.json --actions
 ```
 
 **7 项检查：**
@@ -166,6 +169,45 @@ python tools/phase2_erc_check.py netlist.json --format json
 | `crystal_load_cap` | 晶振是否有匹配的负载电容 | 💡 Suggestion |
 | `floating_pin` | 未连接的引脚（悬空 Net）警告 | 💡 Suggestion |
 | `power_ground_short` | 电源网络是否与地短路 | ❌ Error |
+
+### 3.4 --actions: 可执行修复建议
+
+当传入 `--actions` 标志时，ERC 引擎在生成 findings 之后，会为每条可修复的 finding 生成**结构化 JSON 修复指令**，包含操作类型、目标元件/网络、参数值、LCSC 元件推荐、手册依据。
+
+```bash
+# JSON 输出含 actions 数组
+python tools/phase2_erc_check.py netlist.json --format json --actions
+
+# 带 Design Spec 的精确修复建议
+python tools/phase2_erc_check.py netlist.json --spec design_spec.json --actions
+
+# 全管线
+python tools/parse_jlc_project.py project.eprj2 --format json | \
+  python tools/extract_netlist.py --stdin --format json | \
+  python tools/phase2_erc_check.py --stdin --spec design_spec.json --actions
+```
+
+**10 种操作类型：**
+
+| Action Type | 触发条件 | 说明 |
+|-------------|---------|------|
+| `ADD_DECOUPLING_CAP` | VCC 引脚无去耦电容 | 添加去耦电容到 GND，含 LCSC 推荐和放置建议 |
+| `ADD_PULLUP_RESISTOR` | EN/RST/I2C 引脚缺上拉 | 添加上拉电阻到 VCC |
+| `ADD_PULLDOWN_RESISTOR` | 引脚缺下拉 | 添加下拉电阻到 GND |
+| `ADD_CRYSTAL_LOAD_CAPS` | 晶振缺负载电容 | 对称添加一对 C0G 负载电容 |
+| `CHANGE_CAPACITANCE` | 电容值与手册不符 | 更换为正确容值的电容 |
+| `CHANGE_RESISTANCE` | 电阻值与手册不符 | 更换为正确阻值的电阻 |
+| `CONNECT_PIN_TO_NET` | 应连接但浮空的引脚 | 连接到指定网络 |
+| `DISCONNECT_PIN` | 应浮空但已连接的引脚 | 断开当前连接 |
+| `REVIEW_CRYSTAL_SELECTION` | 晶振 CL 严重不匹配 | 建议替代晶振型号或更换电容 |
+| `REVIEW_MANUALLY` | 无法自动判断 | 需人工确认（如电源-地短路） |
+
+**置信度说明：**
+- 🟢 **high**: 手册明确要求，直接可执行（spec 驱动）
+- 🟡 **medium**: 合理推断，可能有替代方案
+- 🔴 **low**: 启发式猜测，需人工验证
+
+**Markdown 报告**中带 `--actions` 时会增加 "🔧 可执行修复建议" 表格。**JSON 输出**中会新增 `actions` 数组和 `action_stats` 统计字段。
 
 ---
 
@@ -207,42 +249,73 @@ ERC 检查基于启发式规则，可能产生误报：
   └── 建议用户运行 Phase 1 fetch_datasheet.py + parse_datasheet.py 获取手册
 ```
 
+### 4.4 修复建议解读 (--actions)
+
+启用 `--actions` 后，报告底部会增加 "🔧 可执行修复建议" 表格，每行对应一条可执行的修复操作。
+
+**JSON 输出的 `actions` 数组**包含结构化修复指令，可直接用于：
+- 生成 BOM 补料清单（列出缺的元件及 LCSC 编号）
+- 指导原理图修改（添加/更换/断开元件）
+- 向用户展示"缺什么元件、换什么值"
+
+**向用户解释时的要点：**
+1. 🟢 高置信度 + spec 驱动 → 手册明确要求，强烈建议执行
+2. 🟡 中置信度 → 合理建议，但可能有替代方案
+3. 🔴 低置信度 → 仅作参考，需对照手册人工确认
+4. 带 LCSC 推荐的动作 → 可直接采购，减少选型时间
+
 ---
 
 ## 五、与阶段一的衔接（Design Spec）
 
-Phase 1 生成的 **Design Spec JSON** 包含手册的结构化要求。Phase 2 ERC 可通过 `--spec` 参数消费：
+Phase 1 生成的 **Design Spec JSON** 包含手册的结构化要求。Phase 2 ERC 通过 `--spec` 参数消费，从"通用规则猜测"升级为"手册精确对照"。
+
+### 命令
 
 ```bash
-# Step 3+ (即将实现): 带 Design Spec 的精确 ERC
+# 带 Design Spec 的精确 ERC
 python tools/phase2_erc_check.py netlist.json --spec design_spec.json
+
+# 全管线
+python tools/parse_jlc_project.py project.eprj2 --format json | \
+  python tools/extract_netlist.py --stdin --format json | \
+  python tools/phase2_erc_check.py --stdin --spec design_spec.json
 ```
 
-### Design Spec 驱动的精确检查（vs 通用规则）
+### Spec 启用后的增强
 
-| 通用规则（当前） | Design Spec 驱动（Step 3） |
+| 特性 | 说明 |
+|------|------|
+| 通用 7 项检查 | 仍然运行（向后兼容） |
+| `pin_exclusion` 过滤 | 自动排除已知误报（如 PSEN# 不再被报告为 EN 引脚） |
+| 手册对照段落 | 报告新增 "📋 手册对照检查" 部分，逐条对照 Design Spec 的 requirement |
+| 来源标注 | 每条 spec finding 标注 `依据: 手册 §X.Y` |
+| 精确值检查 | 去耦电容检查具体值（100nF±20%）而非通用 80-120nF |
+| CL 偏差计算 | 晶振检查输出实际 CL_eff、目标 CL、偏差百分比 |
+| 固定 LDO 跳过 | 自动识别固定输出 LDO（`rule.notes` 含 `fixed_output`）并跳过反馈检查 |
+| 严重度自适应 | `confidence=low` 自动降级，条件性规则（"如用作XX"）降级为 suggestion |
+
+### Design Spec 驱动的精确检查示例
+
+| 通用规则（无 spec） | Design Spec 驱动（有 spec） |
 |-----------------|-------------------------|
-| "IC VCC 有 100nF 电容?" | "手册 §3.4.9 要求 U2 Pin44 有 100nF 去耦，实际检测: 无 ❌" |
-| "晶振有负载电容?" | "手册 §25.6 要求 CL=20pF，实际 CLeff=26.5pF，偏差+32.5% ⚠️" |
-| "EN 脚浮空?" | "NRST: 手册 §5.1.2 要求 10K 上拉 VCC，实际已接 ✅" |
-
-### 手动交叉参考（Design Spec 未接入前）
-
-在 Step 3 完成前，Claude 可手动执行交叉对比：
-
-```
-① 读取 Phase 1 生成的 design_spec.json
-② 逐条 requirement 对照 ERC 报告中的发现
-③ 区分：
-   - ✅ 真问题 — 手册要求 X，实际原理图违反 X
-   - ❌ 误报 — ERC 发现 Y，但手册明确定义 Y 的例外情况
-   - ⚠️ 待确认 — 手册信息不完整，需查晶振/电阻自身规格书
-   - 💡 低风险 — 优化建议，不修也能工作
-```
+| "IC VCC 有 100nF 电容?" | "手册 §3.4.9 要求 U2 Pin44 有 100nF 去耦，VCC+5V 网络检测到 C1=10µF C2=?，无 100nF ❌" |
+| "晶振有负载电容?" | "手册 §25.6 要求 CL=20pF，实际 C6=C7=47pF → CLeff=26.5pF，偏差+32.5% ❌" |
+| "EN 脚浮空?" | "PSEN#: pin_exclusion 规则排除 ✅ | RST: 手册 §5.1.2 新版内置复位，外部 RC 非必须 💡" |
 
 ### pin_exclusion 优先级最高
 
-如果 Design Spec 包含 `pin_exclusion` 类别，这些排除规则应在所有其他检查之前应用，避免已知误报（如 PSEN# 被误判为 EN 引脚）。
+Design Spec 的 `pin_exclusion` 规则在通用检查之后、报告生成之前应用，过滤已知误报。排除逻辑基于 `pin_pattern` + `check_id` 匹配，不要求 `component_ref` 精确匹配（因为通用检查可能将 finding 归属到同一网络上的其他元件，如排针）。
+
+### 报告解读
+
+- **通用规则检查** 🔍：7 项启发式规则，按 error/warning/suggestion 分级
+- **手册对照检查** 📋：逐条 Design Spec requirement 对照，标注手册出处
+- 底部统计显示手册要求满足率（passed/total）
+
+### 无 spec 时的行为
+
+不传 `--spec` 时，行为与 Step 2 完全一致：7 项通用检查，无 spec 段落，无 pin_exclusion 过滤。
 
 ## 六、与阶段一的衔接（BOM）
 

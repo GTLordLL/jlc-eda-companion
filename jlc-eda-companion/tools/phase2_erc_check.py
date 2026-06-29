@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""嘉立创 EDA ERC 检查引擎 — 7 项电气规则检查
+"""嘉立创 EDA ERC 检查引擎 — 7 项通用检查 + Design Spec 驱动精确检查
 
 读取 extract_netlist.py 的网表 JSON 输出，运行 ERC 检查并生成 Markdown 报告。
 
-检查项：
+通用检查项（7 项）：
   1. IC VCC 引脚去耦电容检测
   2. EN/复位引脚上下拉检测
   3. I2C 总线上拉电阻检测
@@ -12,19 +12,27 @@
   6. 悬空引脚警告
   7. 电源-地短路检测
 
+Design Spec 驱动检查（5 类）：
+  - 去耦电容精确值对照（含 tolerance）
+  - 上拉/下拉电阻精确值对照
+  - 晶振负载电容 CL 偏差计算
+  - 电源反馈 Vout 验证 / 固定输出跳过
+  - 引脚端接状态检查（pullup/pulldown/must_float/must_connect）
+
 用法：
   python phase2_erc_check.py netlist.json
   python phase2_erc_check.py netlist.json --format json
   python phase2_erc_check.py netlist.json --check decoupling,i2c
+  python phase2_erc_check.py netlist.json --spec design_spec.json
 
 管线：
   python parse_jlc_project.py project.eprj2 --format json | \\
     python extract_netlist.py --stdin --format json | \\
-    python phase2_erc_check.py --stdin
+    python phase2_erc_check.py --stdin --spec design_spec.json
 
 Python import:
   from phase2_erc_check import run_erc
-  report = run_erc(netlist)
+  report = run_erc(netlist, design_spec=spec)
 """
 
 from __future__ import annotations
@@ -36,6 +44,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+try:
+    from phase2_action_gen import generate_actions as _generate_actions
+    _ACTIONS_AVAILABLE = True
+except ImportError:
+    _ACTIONS_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 常量
@@ -893,8 +907,981 @@ def check_power_ground_short(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 检查注册表
+# Design Spec 驱动检查（手册精确对照）
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _find_chip_in_netlist(netlist: dict, designator: str) -> Optional[dict]:
+    """在 netlist 中查找指定位号的芯片。"""
+    des_upper = designator.upper()
+    for comp in netlist.get("components", []):
+        if (comp.get("designator") or "").upper() == des_upper:
+            return comp
+    return None
+
+
+def _match_pins(component: dict, pin_pattern: str) -> list[dict]:
+    """匹配 component 中 net_name 满足 pin_pattern (regex) 的引脚。"""
+    import re
+    try:
+        pat = re.compile(pin_pattern, re.IGNORECASE)
+    except re.error:
+        pat = re.compile(re.escape(pin_pattern), re.IGNORECASE)
+    matched = []
+    for pin in component.get("pins", []):
+        net_name = pin.get("net_name") or ""
+        if pat.search(net_name):
+            matched.append(pin)
+    return matched
+
+
+def _find_caps_on_net(netlist: dict, net_name: str) -> list[dict]:
+    """查找同一 net 上的所有电容元件 (C*)。返回 [{designator, value, cap_f, ...}]。"""
+    caps = []
+    net_upper = net_name.upper()
+    for comp in netlist.get("components", []):
+        des = (comp.get("designator") or "").upper()
+        if not des.startswith("C"):
+            continue
+        on_net = any(
+            (p.get("net_name") or "").upper() == net_upper
+            for p in comp.get("pins", [])
+        )
+        if on_net:
+            cap_f = _parse_capacitance_value(comp.get("value", ""))
+            caps.append({
+                "designator": comp.get("designator", ""),
+                "value": comp.get("value", ""),
+                "cap_f": cap_f,
+            })
+    return caps
+
+
+def _find_resistors_on_net(netlist: dict, net_name: str) -> list[dict]:
+    """查找同一 net 上的所有电阻元件 (R*)。返回 [{designator, value, ohm, pins}]。"""
+    resistors = []
+    net_upper = net_name.upper()
+    for comp in netlist.get("components", []):
+        des = (comp.get("designator") or "").upper()
+        if not des.startswith("R"):
+            continue
+        on_net = any(
+            (p.get("net_name") or "").upper() == net_upper
+            for p in comp.get("pins", [])
+        )
+        if on_net:
+            ohm = _parse_resistance_value(comp.get("value", ""))
+            resistors.append({
+                "designator": comp.get("designator", ""),
+                "value": comp.get("value", ""),
+                "ohm": ohm,
+                "pins": comp.get("pins", []),
+            })
+    return resistors
+
+
+def _make_finding(
+    check_id: str,
+    severity: str,
+    component_ref: str,
+    location: str,
+    message: str,
+    detail: str,
+    suggestion: str,
+    source: str | None = None,
+    spec_id: str | None = None,
+    check_type: str = "spec",
+) -> dict:
+    """构建一条 ERC finding（统一工厂函数）。"""
+    f = {
+        "check_id": check_id,
+        "severity": severity,
+        "component_ref": component_ref,
+        "location": location,
+        "message": message,
+        "detail": detail,
+        "suggestion": suggestion,
+        "check_type": check_type,
+    }
+    if source:
+        f["source"] = source
+    if spec_id:
+        f["spec_id"] = spec_id
+    return f
+
+
+def _downgrade_severity(severity: str, steps: int = 1) -> str:
+    """降低严重度等级: error → warning → suggestion → suggestion."""
+    levels = {"error": 0, "warning": 1, "suggestion": 2}
+    current = levels.get(severity, 2)
+    new_level = min(current + steps, 2)
+    return ["error", "warning", "suggestion"][new_level]
+
+
+# ── Spec Check: decoupling ──────────────────────────────────────────────
+
+def _spec_check_decoupling(netlist: dict, req: dict) -> list[dict]:
+    """根据 Design Spec 的 decoupling 规则检查去耦电容。
+
+    rule 必填字段: target_chip, pin_pattern, cap_value, cap_value_f
+    rule 可选字段: tolerance (默认 0.2), placement, distance_mm
+    """
+    findings = []
+    rule = req.get("rule", {})
+    target_chip = rule.get("target_chip", "")
+    pin_pattern = rule.get("pin_pattern", r"VCC|VDD")
+    cap_target_f = rule.get("cap_value_f")
+    cap_target_str = rule.get("cap_value", "?")
+    tolerance = rule.get("tolerance", 0.2)
+    source = req.get("source", "")
+    spec_id = req.get("id", "")
+    req_severity = req.get("severity", "error")
+    notes = rule.get("notes", "")
+
+    chip = _find_chip_in_netlist(netlist, target_chip)
+    if chip is None:
+        findings.append(_make_finding(
+            "spec_decoupling", "warning", target_chip, "",
+            f"Design Spec 目标芯片 {target_chip} 未在 netlist 中找到",
+            f"spec 要求检查 {target_chip} 的去耦电容，但该位号不在当前原理图中。",
+            "确认位号是否匹配，或芯片是否已放置。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    matched_pins = _match_pins(chip, pin_pattern)
+    if not matched_pins:
+        findings.append(_make_finding(
+            "spec_decoupling", "suggestion", target_chip, "",
+            f"{target_chip} 未找到匹配 '{pin_pattern}' 的电源引脚",
+            f"spec 要求检查匹配 {pin_pattern} 的引脚去耦，但未找到匹配引脚。",
+            "确认 pin_pattern 是否与实际原理图网络名一致。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    for pin in matched_pins:
+        pin_num = pin.get("pin_number", "?")
+        net_name = pin.get("net_name") or "(无网络)"
+        caps = _find_caps_on_net(netlist, net_name)
+
+        # 过滤出电容值在 tolerance 范围内的
+        matched_caps = []
+        for c in caps:
+            if c["cap_f"] is not None and cap_target_f is not None:
+                if abs(c["cap_f"] - cap_target_f) / cap_target_f <= tolerance:
+                    matched_caps.append(c)
+
+        if not matched_caps:
+            if caps:
+                # 有电容但值不匹配
+                cap_list = ", ".join(
+                    f"{c['designator']}({c['value']})" for c in caps
+                )
+                findings.append(_make_finding(
+                    "spec_decoupling",
+                    _downgrade_severity(req_severity),
+                    target_chip,
+                    f"Pin {pin_num} ({net_name})",
+                    f"去耦电容值不匹配: 期望 {cap_target_str}±{tolerance*100:.0f}%",
+                    f"手册要求 {cap_target_str}，实际: {cap_list}。"
+                    f"来源: {source}",
+                    f"将电容更换为 {cap_target_str}，或确认该值是否可接受。",
+                    source=source, spec_id=spec_id,
+                ))
+            else:
+                findings.append(_make_finding(
+                    "spec_decoupling",
+                    req_severity,
+                    target_chip,
+                    f"Pin {pin_num} ({net_name})",
+                    f"缺少去耦电容: 手册要求 {cap_target_str}",
+                    f"{target_chip} Pin{pin_num} ({net_name}) 网络上未检测到任何电容。"
+                    f"手册 {source} 要求 {cap_target_str} 去耦电容。",
+                    f"在 {target_chip} Pin{pin_num} 附近添加 {cap_target_str} 去耦电容到 GND。"
+                    f"{' ' + notes if notes else ''}",
+                    source=source, spec_id=spec_id,
+                ))
+
+    return findings
+
+
+# ── Spec Check: pullup / pulldown ───────────────────────────────────────
+
+def _spec_check_pull(netlist: dict, req: dict) -> list[dict]:
+    """根据 Design Spec 的 pullup/pulldown 规则检查上下拉电阻。
+
+    rule 必填字段: target_chip, pin_pattern, resistor_value, resistor_ohm, pull_target
+    """
+    findings = []
+    rule = req.get("rule", {})
+    target_chip = rule.get("target_chip", "")
+    pin_pattern = rule.get("pin_pattern", "")
+    target_ohm = rule.get("resistor_ohm")
+    target_value_str = rule.get("resistor_value", "?")
+    pull_target = rule.get("pull_target", "VCC")  # VCC or GND
+    source = req.get("source", "")
+    spec_id = req.get("id", "")
+    req_severity = req.get("severity", "error")
+    category = req.get("category", "pullup")
+    notes = rule.get("notes", "")
+
+    # 若 notes 注明"可选"/"非必须"，降级 severity
+    optional_keywords = ["可选", "非必须", "内部已集成", "内置", "optional", "not required"]
+    is_optional = any(kw in notes for kw in optional_keywords)
+    effective_severity = (
+        _downgrade_severity(req_severity, 2) if is_optional
+        else req_severity
+    )
+
+    chip = _find_chip_in_netlist(netlist, target_chip)
+    if chip is None:
+        findings.append(_make_finding(
+            f"spec_{category}", "warning", target_chip, "",
+            f"Design Spec 目标芯片 {target_chip} 未在 netlist 中找到",
+            f"spec 要求检查 {target_chip} 的上下拉，但该位号不在当前原理图中。",
+            "确认位号是否匹配。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    matched_pins = _match_pins(chip, pin_pattern)
+    if not matched_pins:
+        findings.append(_make_finding(
+            f"spec_{category}", "suggestion", target_chip, "",
+            f"{target_chip} 未找到匹配 '{pin_pattern}' 的引脚",
+            f"spec 要求检查 {pin_pattern} 的上下拉，但未找到匹配引脚。",
+            "确认 pin_pattern 是否与实际原理图网络名一致。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    for pin in matched_pins:
+        pin_num = pin.get("pin_number", "?")
+        net_name = pin.get("net_name") or ""
+        if not net_name:
+            findings.append(_make_finding(
+                f"spec_{category}", effective_severity, target_chip,
+                f"Pin {pin_num} (无网络)",
+                f"引脚未连接任何网络，无法检查上下拉",
+                f"{target_chip} Pin{pin_num} 无网络连接。",
+                "确认该引脚是否已连接到正确的网络。",
+                source=source, spec_id=spec_id,
+            ))
+            continue
+
+        resistors = _find_resistors_on_net(netlist, net_name)
+        has_pull = False
+        pull_info = ""
+        for r in resistors:
+            # 检查电阻另一端是否连接到 pull_target
+            for rp in r["pins"]:
+                rp_net = (rp.get("net_name") or "").upper()
+                if rp_net == net_name.upper():
+                    continue
+                if pull_target.upper() in rp_net or (
+                    pull_target.upper() == "VCC" and _is_power_net(rp_net)
+                ) or (
+                    pull_target.upper() == "GND" and _is_ground_net(rp_net)
+                ):
+                    has_pull = True
+                    pull_info = f"{r['designator']}({r['value']}) → {rp_net}"
+                    # 检查阻值
+                    if target_ohm is not None and r["ohm"] is not None:
+                        if abs(r["ohm"] - target_ohm) / target_ohm > 0.3:
+                            findings.append(_make_finding(
+                                f"spec_{category}", "warning", target_chip,
+                                f"Pin {pin_num} ({net_name})",
+                                f"上下拉电阻值偏差: 期望 {target_value_str}, 实际 {r['value']}",
+                                f"手册 {source} 建议 {target_value_str}，"
+                                f"实际 {r['designator']}={r['value']}（偏差 {(abs(r['ohm']-target_ohm)/target_ohm)*100:.0f}%）。",
+                                f"确认 {r['designator']} 阻值是否可接受，或更换为 {target_value_str}。",
+                                source=source, spec_id=spec_id,
+                            ))
+                    break
+            if has_pull:
+                break
+
+        if not has_pull:
+            pull_dir = "上拉到 VCC" if "VCC" in pull_target.upper() else "下拉到 GND"
+            findings.append(_make_finding(
+                f"spec_{category}", effective_severity, target_chip,
+                f"Pin {pin_num} ({net_name})",
+                f"缺少{pull_dir}电阻: 手册要求 {target_value_str}",
+                f"{target_chip} Pin{pin_num} ({net_name}) 网络上未检测到{pull_dir}的电阻。"
+                f"手册 {source} 要求 {target_value_str} {pull_dir}。",
+                f"在 {target_chip} Pin{pin_num} 与 {pull_target} 之间添加 {target_value_str} 电阻。"
+                f"{' (' + notes + ')' if notes else ''}",
+                source=source, spec_id=spec_id,
+            ))
+
+    return findings
+
+
+# ── Spec Check: crystal ─────────────────────────────────────────────────
+
+def _spec_check_crystal(netlist: dict, req: dict) -> list[dict]:
+    """根据 Design Spec 的 crystal 规则检查晶振负载电容。
+
+    rule 必填字段: target_chip, pin_pattern, load_cap_pf
+    rule 可选字段: frequency, stray_cap_pf (默认 3.0), suggested_caps_pf, confidence
+    """
+    findings = []
+    rule = req.get("rule", {})
+    target_chip = rule.get("target_chip", "")
+    pin_pattern = rule.get("pin_pattern", r"XTAL")
+    load_cap_pf = rule.get("load_cap_pf")
+    stray_cap_pf = rule.get("stray_cap_pf", CSTRAY_DEFAULT)
+    suggested_caps_pf = rule.get("suggested_caps_pf")
+    frequency = rule.get("frequency", "")
+    confidence = rule.get("confidence", "high")
+    source = req.get("source", "")
+    spec_id = req.get("id", "")
+    req_severity = req.get("severity", "warning")
+    notes = rule.get("notes", "")
+
+    # confidence=low 时降级
+    if confidence == "low":
+        effective_severity = _downgrade_severity(req_severity, 1)
+    else:
+        effective_severity = req_severity
+
+    chip = _find_chip_in_netlist(netlist, target_chip)
+    if chip is None:
+        findings.append(_make_finding(
+            "spec_crystal", "warning", target_chip, "",
+            f"Design Spec 目标芯片 {target_chip} 未在 netlist 中找到",
+            f"spec 要求检查 {target_chip} 的晶振电路，但该位号不在当前原理图中。",
+            "确认位号是否匹配。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    matched_pins = _match_pins(chip, pin_pattern)
+    if len(matched_pins) < 2:
+        findings.append(_make_finding(
+            "spec_crystal", "suggestion", target_chip, "",
+            f"{target_chip} 匹配 '{pin_pattern}' 的引脚不足 2 个 (找到 {len(matched_pins)})",
+            f"spec 要求检查晶振电路，但匹配的 XTAL 引脚少于 2 个。",
+            "确认 pin_pattern 是否正确，或晶振是否已放置。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    # 找到晶振元件 (通过 XTAL 引脚 net 追踪)
+    xtal_nets = set()
+    for pin in matched_pins:
+        net_name = pin.get("net_name")
+        if net_name:
+            xtal_nets.add(net_name.upper())
+
+    # 找在每个 XTAL net 上的晶振 (Y*/X*)
+    crystal_comp = None
+    for comp in netlist.get("components", []):
+        des = (comp.get("designator") or "").upper()
+        dev_name = (comp.get("device_name", "") or comp.get("name", "")).lower()
+        is_xtal = (
+            des.startswith("Y") or des.startswith("X") or
+            any(kw in dev_name for kw in ("crystal", "晶振", "xtal"))
+        )
+        if not is_xtal:
+            continue
+        comp_nets = set(
+            (p.get("net_name") or "").upper()
+            for p in comp.get("pins", [])
+            if p.get("net_name")
+        )
+        if comp_nets & xtal_nets:
+            crystal_comp = comp
+            break
+
+    if crystal_comp is None:
+        # 直接在 XTAL 引脚 net 上找电容
+        pin_caps = []
+        for pin in matched_pins:
+            pin_net = pin.get("net_name") or ""
+            if not pin_net:
+                continue
+            for c2 in netlist.get("components", []):
+                c2_des = (c2.get("designator") or "").upper()
+                if not c2_des.startswith("C"):
+                    continue
+                c2_on_pin_net = False
+                c2_on_gnd = False
+                for p2 in c2.get("pins", []):
+                    p2_net = (p2.get("net_name") or "").upper()
+                    if p2_net == pin_net.upper():
+                        c2_on_pin_net = True
+                    if _is_ground_net(p2_net):
+                        c2_on_gnd = True
+                if c2_on_pin_net and c2_on_gnd:
+                    cap_f = _parse_capacitance_value(c2.get("value", ""))
+                    pin_caps.append({
+                        "pin": pin.get("pin_number"),
+                        "cap_ref": c2.get("designator", ""),
+                        "cap_value": c2.get("value", ""),
+                        "cap_f": cap_f,
+                    })
+                    break
+
+        if len(pin_caps) < 2:
+            findings.append(_make_finding(
+                "spec_crystal", effective_severity, target_chip, "",
+                f"晶振负载电容不完整: 仅检测到 {len(pin_caps)} 个",
+                f"手册 {source} 要求 CL≈{load_cap_pf}pF，"
+                f"但 {target_chip} XTAL 引脚仅 {len(pin_caps)} 个电容到 GND。",
+                f"每个 XTAL 引脚应对称接电容到 GND。"
+                f"{'建议值: ' + str(suggested_caps_pf) + 'pF' if suggested_caps_pf else ''}",
+                source=source, spec_id=spec_id,
+            ))
+            return findings
+
+        c1_f = pin_caps[0].get("cap_f")
+        c2_f = pin_caps[1].get("cap_f")
+    else:
+        # 通过晶振元件找电容
+        pin_caps = []
+        for cpin in crystal_comp.get("pins", []):
+            cpin_net = (cpin.get("net_name") or "").upper()
+            if not cpin_net:
+                continue
+            for c2 in netlist.get("components", []):
+                c2_des = (c2.get("designator") or "").upper()
+                if not c2_des.startswith("C"):
+                    continue
+                c2_on_pin_net = False
+                c2_on_gnd = False
+                for p2 in c2.get("pins", []):
+                    p2_net = (p2.get("net_name") or "").upper()
+                    if p2_net == cpin_net:
+                        c2_on_pin_net = True
+                    if _is_ground_net(p2_net):
+                        c2_on_gnd = True
+                if c2_on_pin_net and c2_on_gnd:
+                    cap_f = _parse_capacitance_value(c2.get("value", ""))
+                    pin_caps.append({
+                        "pin": cpin.get("pin_number"),
+                        "cap_ref": c2.get("designator", ""),
+                        "cap_value": c2.get("value", ""),
+                        "cap_f": cap_f,
+                    })
+                    break
+
+        if len(pin_caps) < 2:
+            findings.append(_make_finding(
+                "spec_crystal", effective_severity,
+                crystal_comp.get("designator", target_chip), "",
+                f"晶振负载电容不完整: 仅检测到 {len(pin_caps)} 个",
+                f"手册 {source} 要求 CL≈{load_cap_pf}pF，"
+                f"但晶振 {crystal_comp.get('designator','?')} 仅 {len(pin_caps)} 个电容到 GND。",
+                f"每个晶振引脚应对称接电容到 GND。"
+                f"{'建议值: ' + str(suggested_caps_pf) + 'pF' if suggested_caps_pf else ''}",
+                source=source, spec_id=spec_id,
+            ))
+            return findings
+
+        c1_f = pin_caps[0].get("cap_f")
+        c2_f = pin_caps[1].get("cap_f")
+
+    if c1_f is None or c2_f is None:
+        findings.append(_make_finding(
+            "spec_crystal", "suggestion",
+            crystal_comp.get("designator", target_chip) if crystal_comp else target_chip,
+            f"{pin_caps[0].get('cap_ref','?')}({pin_caps[0].get('cap_value','?')}), "
+            f"{pin_caps[1].get('cap_ref','?')}({pin_caps[1].get('cap_value','?')})",
+            "晶振负载电容值无法解析，请手动确认",
+            f"手册 {source} 要求 CL≈{load_cap_pf}pF，但电容值无法自动解析。"
+            f"C1={pin_caps[0].get('cap_value','?')}, C2={pin_caps[1].get('cap_value','?')}。",
+            f"确认电容值是否满足晶振 CL={load_cap_pf}pF 的要求。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    # 计算 CL_eff
+    cl_eff = (c1_f * c2_f) / (c1_f + c2_f) + stray_cap_pf * 1e-12
+    cl_eff_pf = cl_eff * 1e12
+    deviation = (cl_eff_pf - load_cap_pf) / load_cap_pf
+
+    freq_str = f" {frequency}" if frequency else ""
+
+    if abs(deviation) < 0.10:
+        # 偏差 <10%，不生成 finding (通过)
+        pass
+    elif abs(deviation) < 0.30:
+        findings.append(_make_finding(
+            "spec_crystal", _downgrade_severity(effective_severity),
+            crystal_comp.get("designator", target_chip) if crystal_comp else target_chip,
+            f"{pin_caps[0]['cap_ref']}({pin_caps[0]['cap_value']}), "
+            f"{pin_caps[1]['cap_ref']}({pin_caps[1]['cap_value']})",
+            f"晶振负载电容偏差: CL目标{load_cap_pf}pF, 实际CL_eff≈{cl_eff_pf:.1f}pF (偏差{deviation*100:+.1f}%)",
+            f"手册 {source} 要求{freq_str} CL≈{load_cap_pf}pF (Cstray={stray_cap_pf}pF)。"
+            f"实际 CL_eff = ({pin_caps[0].get('cap_value','?')}×{pin_caps[1].get('cap_value','?')})/"
+            f"({pin_caps[0].get('cap_value','?')}+{pin_caps[1].get('cap_value','?')}) + {stray_cap_pf}pF"
+            f" = {cl_eff_pf:.1f}pF，偏差 {deviation*100:+.1f}%。",
+            f"建议更换为 {suggested_caps_pf}pF 电容。"
+            if suggested_caps_pf else
+            f"建议调整电容使 CL_eff 接近 {load_cap_pf}pF。"
+            f" C_ideal = 2×({load_cap_pf}−{stray_cap_pf}) = {2*(load_cap_pf-stray_cap_pf):.1f}pF。"
+            f"{' 置信度偏低，以晶振实际规格书为准。' if confidence == 'low' else ''}",
+            source=source, spec_id=spec_id,
+        ))
+    else:
+        findings.append(_make_finding(
+            "spec_crystal", effective_severity,
+            crystal_comp.get("designator", target_chip) if crystal_comp else target_chip,
+            f"{pin_caps[0]['cap_ref']}({pin_caps[0]['cap_value']}), "
+            f"{pin_caps[1]['cap_ref']}({pin_caps[1]['cap_value']})",
+            f"晶振负载电容严重偏差: CL目标{load_cap_pf}pF, 实际CL_eff≈{cl_eff_pf:.1f}pF (偏差{deviation*100:+.1f}%)",
+            f"手册 {source} 要求{freq_str} CL≈{load_cap_pf}pF。"
+            f"实际 CL_eff = {cl_eff_pf:.1f}pF，偏差 {deviation*100:+.1f}%，超过 30%。"
+            f"晶振可能无法正常起振或频率偏差过大。",
+            f"必须更换负载电容。建议值: {suggested_caps_pf}pF。"
+            if suggested_caps_pf else
+            f"必须更换负载电容。C_ideal = 2×({load_cap_pf}−{stray_cap_pf}) = {2*(load_cap_pf-stray_cap_pf):.1f}pF。",
+            source=source, spec_id=spec_id,
+        ))
+
+    return findings
+
+
+# ── Spec Check: power_feedback ──────────────────────────────────────────
+
+def _spec_check_feedback(netlist: dict, req: dict) -> list[dict]:
+    """根据 Design Spec 的 power_feedback 规则检查电源反馈。
+
+    rule 必填字段: target_chip, vref, target_vout
+    rule 可选字段: r1_ohm, r2_ohm, notes
+    """
+    findings = []
+    rule = req.get("rule", {})
+    target_chip = rule.get("target_chip", "")
+    vref = rule.get("vref", 1.25)
+    target_vout = rule.get("target_vout")
+    source = req.get("source", "")
+    spec_id = req.get("id", "")
+    notes = rule.get("notes", "")
+
+    # 固定输出 LDO → 跳过
+    if "fixed_output" in notes or "固定输出" in notes:
+        findings.append(_make_finding(
+            "spec_feedback", "suggestion", target_chip, "",
+            f"{target_chip} 为固定输出 LDO，跳过反馈分压检查",
+            f"手册 {source}: {target_chip} 内部集成反馈电阻，固定输出 {target_vout}V，无需外部反馈网络。",
+            "无需操作。若实际输出电压异常请检查芯片是否损坏。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    chip = _find_chip_in_netlist(netlist, target_chip)
+    if chip is None:
+        findings.append(_make_finding(
+            "spec_feedback", "warning", target_chip, "",
+            f"Design Spec 目标芯片 {target_chip} 未在 netlist 中找到",
+            f"spec 要求检查 {target_chip} 的反馈分压，但该位号不在当前原理图中。",
+            "确认位号是否匹配。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    # 找 FB/ADJ 引脚
+    fb_pins = []
+    for pin in chip.get("pins", []):
+        net_name = (pin.get("net_name") or "").upper()
+        if any(fb_kw.upper() in net_name for fb_kw in _FB_PIN_NAMES):
+            fb_pins.append(pin)
+
+    if not fb_pins:
+        findings.append(_make_finding(
+            "spec_feedback", "warning", target_chip, "",
+            f"{target_chip} 未找到 FB/ADJ 引脚",
+            f"spec 要求检查反馈分压，但 {target_chip} 未检测到 FB/ADJ 引脚网络。"
+            f"若为固定输出 LDO，应在 spec rule.notes 中标注 'fixed_output'。",
+            "确认芯片类型: 固定输出还是可调输出？",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    for fpin in fb_pins:
+        fb_net = (fpin.get("net_name") or "").upper()
+        pin_num = fpin.get("pin_number", "?")
+
+        r_to_vout = None
+        r_to_gnd = None
+
+        for c2 in netlist.get("components", []):
+            c2_des = c2.get("designator", "")
+            if not c2_des.upper().startswith("R"):
+                continue
+            c2_pin_nets = {}
+            for p2 in c2.get("pins", []):
+                pn = (p2.get("net_name") or "").upper()
+                if pn:
+                    c2_pin_nets[pn] = pn
+
+            if fb_net not in c2_pin_nets:
+                continue
+
+            r_val = _parse_resistance_value(c2.get("value", ""))
+            if r_val is None:
+                continue
+
+            for pn in c2_pin_nets:
+                if pn == fb_net:
+                    continue
+                if _is_power_net(pn) and not _is_ground_net(pn):
+                    r_to_vout = (c2_des, r_val)
+                elif _is_ground_net(pn):
+                    r_to_gnd = (c2_des, r_val)
+
+        if not r_to_vout or not r_to_gnd:
+            findings.append(_make_finding(
+                "spec_feedback", "error", target_chip,
+                f"Pin {pin_num} (FB/ADJ)",
+                "未检测到完整的反馈电阻网络",
+                f"手册 {source}: {target_chip} Vref={vref}V, 目标 Vout={target_vout}V。"
+                f"需要 R1(FB→VOUT) 和 R2(FB→GND)，但当前: "
+                f"R_to_VOUT={r_to_vout[0] if r_to_vout else '无'}, "
+                f"R_to_GND={r_to_gnd[0] if r_to_gnd else '无'}。",
+                "确认反馈电阻网络是否完整。可使用 compute_passive.py 计算所需阻值。",
+                source=source, spec_id=spec_id,
+            ))
+            continue
+
+        r1_val = r_to_vout[1]
+        r2_val = r_to_gnd[1]
+        vout_calc = vref * (1 + r1_val / r2_val)
+
+        deviation = abs(vout_calc - target_vout) / target_vout
+        if deviation < 0.05:
+            # 偏差 <5%，通过
+            pass
+        else:
+            findings.append(_make_finding(
+                "spec_feedback",
+                "error" if deviation > 0.10 else "warning",
+                target_chip,
+                f"Pin {pin_num} (FB): R1={r_to_vout[0]}({r1_val:.0f}Ω→VOUT), "
+                f"R2={r_to_gnd[0]}({r2_val:.0f}Ω→GND)",
+                f"反馈分压不匹配: 计算 Vout={vout_calc:.2f}V, 目标 {target_vout}V (偏差 {deviation*100:.1f}%)",
+                f"手册 {source}: Vref={vref}V, 目标 Vout={target_vout}V。"
+                f"实际 Vout = {vref} × (1 + {r1_val:.0f}/{r2_val:.0f}) = {vout_calc:.2f}V。",
+                f"调整 R1={r_to_vout[0]} 或 R2={r_to_gnd[0]} 使 Vout 接近 {target_vout}V。"
+                f"理想比值 R1/R2 = ({target_vout}/{vref} - 1) = {target_vout/vref - 1:.2f}。",
+                source=source, spec_id=spec_id,
+            ))
+
+    return findings
+
+
+# ── Spec Check: pin_termination ─────────────────────────────────────────
+
+def _spec_check_termination(netlist: dict, req: dict) -> list[dict]:
+    """根据 Design Spec 的 pin_termination 规则检查引脚端接状态。
+
+    rule 必填字段: target_chip, pin_pattern, termination
+    rule 可选字段: resistor_value, resistor_ohm, notes
+    termination 取值: pullup_to_vcc | pulldown_to_gnd | must_connect | must_float | connect_to_net
+    """
+    findings = []
+    rule = req.get("rule", {})
+    target_chip = rule.get("target_chip", "")
+    pin_pattern = rule.get("pin_pattern", "")
+    termination = rule.get("termination", "")
+    resistor_ohm = rule.get("resistor_ohm")
+    resistor_value_str = rule.get("resistor_value", "?")
+    source = req.get("source", "")
+    spec_id = req.get("id", "")
+    req_severity = req.get("severity", "error")
+    notes = rule.get("notes", "")
+
+    # 若 notes 含条件性描述，降级
+    conditional_keywords = ["如用作", "若用作", "如果", "如不需", "可浮空", "可不接"]
+    is_conditional = any(kw in notes for kw in conditional_keywords)
+    effective_severity = (
+        _downgrade_severity(req_severity, 1) if is_conditional
+        else req_severity
+    )
+
+    chip = _find_chip_in_netlist(netlist, target_chip)
+    if chip is None:
+        findings.append(_make_finding(
+            "spec_termination", "warning", target_chip, "",
+            f"Design Spec 目标芯片 {target_chip} 未在 netlist 中找到",
+            f"spec 要求检查 {target_chip} 的引脚端接，但该位号不在当前原理图中。",
+            "确认位号是否匹配。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    matched_pins = _match_pins(chip, pin_pattern)
+    if not matched_pins:
+        findings.append(_make_finding(
+            "spec_termination", "suggestion", target_chip, "",
+            f"{target_chip} 未找到匹配 '{pin_pattern}' 的引脚",
+            f"spec 要求检查 {pin_pattern} 引脚的端接状态，但未找到匹配引脚。",
+            "确认 pin_pattern 是否与实际原理图网络名一致。",
+            source=source, spec_id=spec_id,
+        ))
+        return findings
+
+    for pin in matched_pins:
+        pin_num = pin.get("pin_number", "?")
+        net_name = pin.get("net_name") or ""
+        net_id = pin.get("net_id")
+
+        if termination == "must_float":
+            if net_name and net_id is not None:
+                findings.append(_make_finding(
+                    "spec_termination",
+                    "warning",
+                    target_chip,
+                    f"Pin {pin_num} ({net_name})",
+                    f"引脚应浮空但已连接: {net_name}",
+                    f"手册 {source}: {target_chip} Pin{pin_num} 应保持浮空。"
+                    f"当前连接到 {net_name}。{notes}",
+                    f"断开 {target_chip} Pin{pin_num} 与 {net_name} 的连接。",
+                    source=source, spec_id=spec_id,
+                ))
+
+        elif termination == "pullup_to_vcc":
+            if not net_name:
+                findings.append(_make_finding(
+                    "spec_termination", effective_severity, target_chip,
+                    f"Pin {pin_num} (无网络)",
+                    f"引脚应上拉到 VCC，但未连接任何网络",
+                    f"手册 {source}: {target_chip} Pin{pin_num} 必须上拉到 VCC。{notes}",
+                    f"将 {target_chip} Pin{pin_num} 通过{resistor_value_str + ' ' if resistor_value_str != '?' else ''}上拉电阻连接到 VCC。",
+                    source=source, spec_id=spec_id,
+                ))
+                continue
+
+            # 检查是否已上拉
+            resistors = _find_resistors_on_net(netlist, net_name)
+            has_pullup = False
+            for r in resistors:
+                for rp in r["pins"]:
+                    rp_net = (rp.get("net_name") or "").upper()
+                    if rp_net == net_name.upper():
+                        continue
+                    if _is_power_net(rp_net):
+                        has_pullup = True
+                        if resistor_ohm and r["ohm"]:
+                            if abs(r["ohm"] - resistor_ohm) / resistor_ohm > 0.3:
+                                findings.append(_make_finding(
+                                    "spec_termination", "warning", target_chip,
+                                    f"Pin {pin_num} ({net_name})",
+                                    f"上拉电阻值偏差: 期望 {resistor_value_str}, 实际 {r['value']}",
+                                    f"手册 {source} 建议 {resistor_value_str}。"
+                                    f"实际 {r['designator']}={r['value']}。",
+                                    f"确认 {r['designator']} 阻值是否可接受。",
+                                    source=source, spec_id=spec_id,
+                                ))
+                        break
+                if has_pullup:
+                    break
+
+            if not has_pullup:
+                # 检查 net 是否直接是 VCC
+                if _is_power_net(net_name):
+                    pass  # 直接接 VCC，OK
+                else:
+                    findings.append(_make_finding(
+                        "spec_termination", effective_severity, target_chip,
+                        f"Pin {pin_num} ({net_name})",
+                        f"引脚缺少上拉到 VCC",
+                        f"手册 {source}: {target_chip} Pin{pin_num} 必须上拉到 VCC。"
+                        f"当前网络 {net_name} 未检测到上拉电阻或 VCC 连接。{notes}",
+                        f"在 {target_chip} Pin{pin_num} 与 VCC 之间添加"
+                        f"{resistor_value_str + ' ' if resistor_value_str != '?' else ''}上拉电阻。",
+                        source=source, spec_id=spec_id,
+                    ))
+
+        elif termination == "pulldown_to_gnd":
+            if not net_name:
+                findings.append(_make_finding(
+                    "spec_termination", effective_severity, target_chip,
+                    f"Pin {pin_num} (无网络)",
+                    f"引脚应下拉到 GND，但未连接任何网络",
+                    f"手册 {source}: {target_chip} Pin{pin_num} 必须下拉到 GND。{notes}",
+                    f"将 {target_chip} Pin{pin_num} 通过{resistor_value_str + ' ' if resistor_value_str != '?' else ''}下拉电阻连接到 GND。",
+                    source=source, spec_id=spec_id,
+                ))
+                continue
+
+            resistors = _find_resistors_on_net(netlist, net_name)
+            has_pulldown = any(
+                any(
+                    _is_ground_net((rp.get("net_name") or "").upper())
+                    for rp in r["pins"]
+                    if (rp.get("net_name") or "").upper() != net_name.upper()
+                )
+                for r in resistors
+            )
+
+            if not has_pulldown and not _is_ground_net(net_name):
+                findings.append(_make_finding(
+                    "spec_termination", effective_severity, target_chip,
+                    f"Pin {pin_num} ({net_name})",
+                    f"引脚缺少下拉到 GND",
+                    f"手册 {source}: {target_chip} Pin{pin_num} 必须下拉到 GND。"
+                    f"当前网络 {net_name} 未检测到下拉电阻或 GND 连接。{notes}",
+                    f"在 {target_chip} Pin{pin_num} 与 GND 之间添加"
+                    f"{resistor_value_str + ' ' if resistor_value_str != '?' else ''}下拉电阻。",
+                    source=source, spec_id=spec_id,
+                ))
+
+        elif termination == "must_connect":
+            # 仅检查引脚是否有网络连接
+            if not net_name:
+                findings.append(_make_finding(
+                    "spec_termination", effective_severity, target_chip,
+                    f"Pin {pin_num}",
+                    "引脚未连接（应连接）",
+                    f"手册 {source}: {target_chip} Pin{pin_num} 必须连接。"
+                    f"当前浮空。{notes}",
+                    f"根据手册要求连接 {target_chip} Pin{pin_num}。",
+                    source=source, spec_id=spec_id,
+                ))
+
+    return findings
+
+
+# ── Spec Check 调度器 ───────────────────────────────────────────────────
+
+# Design Spec category → spec check function 映射
+SPEC_CATEGORY_CHECKERS: dict[str, callable | None] = {
+    "decoupling": _spec_check_decoupling,
+    "pullup": _spec_check_pull,
+    "pulldown": _spec_check_pull,
+    "crystal": _spec_check_crystal,
+    "power_feedback": _spec_check_feedback,
+    "pin_termination": _spec_check_termination,
+    "pin_exclusion": None,  # 不生成 finding，仅用于过滤
+}
+
+SPEC_CATEGORY_NAMES = {
+    "decoupling": "去耦电容",
+    "pullup": "上拉电阻",
+    "pulldown": "下拉电阻",
+    "crystal": "晶振负载电容",
+    "power_feedback": "电源反馈分压",
+    "pin_termination": "引脚端接",
+    "pin_exclusion": "引脚排除",
+}
+
+
+def spec_driven_checks(netlist: dict, spec: dict) -> list[dict]:
+    """根据 Design Spec 的每条 requirement 执行精确对照检查。
+
+    Args:
+        netlist: extract_netlist 输出
+        spec: Design Spec JSON (dict)
+
+    Returns:
+        list[dict] — 每条 finding 额外包含 source, spec_id, check_type="spec"
+    """
+    findings = []
+    requirements = spec.get("requirements", [])
+    if not requirements:
+        return findings
+
+    for req in requirements:
+        category = req.get("category", "")
+        checker = SPEC_CATEGORY_CHECKERS.get(category)
+        if checker is None:
+            continue  # pin_exclusion 不生成 finding
+
+        try:
+            result = checker(netlist, req)
+            if result:
+                findings.extend(result)
+        except Exception as e:
+            findings.append(_make_finding(
+                f"spec_{category}", "error", "", "",
+                f"Spec 检查执行失败 (id={req.get('id','?')}): {e}",
+                str(e),
+                "检查输入数据格式和 spec 规则定义。",
+                source=req.get("source", ""),
+                spec_id=req.get("id", ""),
+            ))
+
+    return findings
+
+
+def apply_pin_exclusions(
+    findings: list[dict],
+    spec: dict,
+) -> tuple[list[dict], int]:
+    """应用 pin_exclusion 规则过滤通用检查的误报。
+
+    Args:
+        findings: 通用检查的 finding 列表
+        spec: Design Spec JSON (dict)
+
+    Returns:
+        (filtered_findings, exclusion_count)
+    """
+    import re
+
+    # 收集所有 pin_exclusion 规则
+    exclusions: list[dict] = []
+    for req in spec.get("requirements", []):
+        if req.get("category") != "pin_exclusion":
+            continue
+        rule = req.get("rule", {})
+        exclusions.append({
+            "target_chip": (rule.get("target_chip") or "").upper(),
+            "pin_pattern": rule.get("pin_pattern", ""),
+            "exclude_from": [c.strip() for c in rule.get("exclude_from_checks", [])],
+            "reason": rule.get("reason", ""),
+        })
+
+    if not exclusions:
+        return findings, 0
+
+    filtered = []
+    exclusion_count = 0
+
+    for f in findings:
+        excluded = False
+        f_chip = (f.get("component_ref") or "").upper()
+        f_check_id = f.get("check_id", "")
+        f_location = f.get("location", "")
+
+        for exc in exclusions:
+            # 检查 check_id 在 exclude_from 中
+            if f_check_id not in exc["exclude_from"]:
+                continue
+            # 检查 location 匹配 pin_pattern（这是主要判断依据，因为
+            # 通用检查可能将 finding 归属到同 net 上的其他元件上，而非 target_chip）
+            pat_matched = False
+            try:
+                if re.search(exc["pin_pattern"], f_location, re.IGNORECASE):
+                    pat_matched = True
+            except re.error:
+                if exc["pin_pattern"].upper() in f_location.upper():
+                    pat_matched = True
+            if not pat_matched:
+                continue
+            # target_chip 约束：非空时必须匹配 component_ref（可选约束）
+            if exc["target_chip"] and exc["target_chip"] != f_chip:
+                # 即使 component_ref 不匹配，若 location 中已确认包含 pin_pattern，
+                # 说明该 finding 是关于被排除引脚的，仍应排除
+                # (如 PSEN# 被 H6 报告而非 U2)
+                pass  # 不跳过，继续排除
+            excluded = True
+            break
+
+        if excluded:
+            exclusion_count += 1
+        else:
+            filtered.append(f)
+
+    return filtered, exclusion_count
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 检查注册表
+# ═══════════════════════════════════════════════════════════════════════════
 
 ALL_CHECKS: dict[str, callable] = {
     "decoupling_cap": check_decoupling_caps,
@@ -924,22 +1911,31 @@ CHECK_NAMES = {
 def run_erc(
     netlist: dict,
     datasheet_context: dict | None = None,
+    design_spec: dict | None = None,
     checks: list[str] | None = None,
+    generate_actions: bool = False,
 ) -> dict:
     """运行 ERC 检查。
 
     Args:
         netlist: extract_netlist.extract_netlist() 的输出。
         datasheet_context: Phase 1 数据手册上下文 (可选)。
+        design_spec: Design Spec JSON (Phase 1→2 桥梁，可选)。
         checks: 要运行的检查项 ID 列表。None = 全部。
+        generate_actions: 是否生成结构化修复建议 (含 LCSC 推荐)。
 
     Returns:
         {
             "project_name": str,
             "timestamp": str,
+            "checks_run": [...],
             "findings": {"errors": [...], "warnings": [...], "suggestions": [...]},
+            "spec_applied": bool,
+            "spec_stats": {...} | None,
             "stats": {...},
             "markdown_report": str,
+            "actions": [...] | None,
+            "action_stats": {...} | None,
         }
     """
     if "error" in netlist:
@@ -953,6 +1949,7 @@ def run_erc(
         if invalid:
             return {"error": f"无效的检查项: {invalid}。可用: {list(ALL_CHECKS.keys())}"}
 
+    # ── 阶段 1: 通用检查 ──
     all_findings = []
     for check_id in checks:
         try:
@@ -967,9 +1964,100 @@ def run_erc(
                 "message": f"检查项 {check_id} 执行失败: {e}",
                 "detail": str(e),
                 "suggestion": "检查输入数据格式。",
+                "check_type": "generic",
             })
 
-    # 按严重度分组
+    # ── 阶段 2: Design Spec 驱动检查（如提供）──
+    spec_findings: list[dict] = []
+    exclusion_count = 0
+    spec_stats = None
+
+    if design_spec:
+        # 2a. 应用 pin_exclusion 过滤通用检查
+        all_findings, exclusion_count = apply_pin_exclusions(
+            all_findings, design_spec
+        )
+
+        # 2b. 运行 spec 驱动检查
+        spec_findings = spec_driven_checks(netlist, design_spec)
+
+        # 2c. 统计
+        requirements = design_spec.get("requirements", [])
+        spec_errors = sum(1 for f in spec_findings if f["severity"] == "error")
+        spec_warnings = sum(1 for f in spec_findings if f["severity"] == "warning")
+        spec_suggestions = sum(1 for f in spec_findings if f["severity"] == "suggestion")
+        spec_checked = sum(
+            1 for r in requirements
+            if r.get("category") != "pin_exclusion"
+        )
+        spec_skipped = sum(
+            1 for r in requirements
+            if r.get("category") == "pin_exclusion"
+        )
+        spec_passed = spec_checked - len(spec_findings)
+
+        spec_stats = {
+            "requirements_total": len(requirements),
+            "requirements_checked": spec_checked,
+            "requirements_skipped": spec_skipped,
+            "requirements_passed": max(0, spec_passed),
+            "exclusions_applied": exclusion_count,
+            "spec_errors": spec_errors,
+            "spec_warnings": spec_warnings,
+            "spec_suggestions": spec_suggestions,
+        }
+
+    # ── 合并 & 分组 ──
+    all_findings.extend(spec_findings)
+
+    # ── 阶段 3: 生成可执行修复建议（如启用）──
+    actions = None
+    action_stats = None
+    if generate_actions:
+        if not _ACTIONS_AVAILABLE:
+            actions = [{
+                "action_id": "error",
+                "action_type": "REVIEW_MANUALLY",
+                "target": {},
+                "parameters": {"notes": "phase2_action_gen 模块不可用，无法生成修复建议。"},
+                "reason": "Action generation module not found",
+                "confidence": "low",
+                "source": {"type": "heuristic", "reference": "internal error"},
+                "triggered_by": {"check_id": "", "severity": "", "message": "", "finding_index": -1},
+            }]
+        else:
+            try:
+                actions = _generate_actions(all_findings, netlist, design_spec)
+            except Exception as e:
+                actions = [{
+                    "action_id": "error",
+                    "action_type": "REVIEW_MANUALLY",
+                    "target": {},
+                    "parameters": {"notes": f"动作生成失败: {e}"},
+                    "reason": f"Action generation failed: {e}",
+                    "confidence": "low",
+                    "source": {"type": "heuristic", "reference": "internal error"},
+                    "triggered_by": {"check_id": "", "severity": "", "message": "", "finding_index": -1},
+                }]
+        if actions:
+            # 统计
+            by_type: dict[str, int] = {}
+            by_confidence: dict[str, int] = {}
+            with_lcsc = 0
+            for a in actions:
+                at = a.get("action_type", "?")
+                by_type[at] = by_type.get(at, 0) + 1
+                ac = a.get("confidence", "low")
+                by_confidence[ac] = by_confidence.get(ac, 0) + 1
+                if a.get("parameters", {}).get("suggested_parts"):
+                    with_lcsc += 1
+            action_stats = {
+                "total": len(actions),
+                "by_type": by_type,
+                "by_confidence": by_confidence,
+                "with_lcsc_suggestions": with_lcsc,
+            }
+
     errors = [f for f in all_findings if f["severity"] == "error"]
     warnings = [f for f in all_findings if f["severity"] == "warning"]
     suggestions = [f for f in all_findings if f["severity"] == "suggestion"]
@@ -978,13 +2066,22 @@ def run_erc(
     project_name = netlist.get("project_name", "")
     stats = netlist.get("stats", {})
 
-    # 生成 Markdown 报告
+    # ── 生成 Markdown 报告 ──
     report = _format_markdown_report(
         project_name, timestamp, checks,
         errors, warnings, suggestions, stats,
+        spec_applied=design_spec is not None,
+        spec_stats=spec_stats,
+        generic_errors=[f for f in errors if f.get("check_type") != "spec"],
+        generic_warnings=[f for f in warnings if f.get("check_type") != "spec"],
+        generic_suggestions=[f for f in suggestions if f.get("check_type") != "spec"],
+        spec_errors=[f for f in errors if f.get("check_type") == "spec"],
+        spec_warnings=[f for f in warnings if f.get("check_type") == "spec"],
+        spec_suggestions=[f for f in suggestions if f.get("check_type") == "spec"],
+        actions=actions,
     )
 
-    return {
+    result = {
         "project_name": project_name,
         "timestamp": timestamp,
         "checks_run": checks,
@@ -999,8 +2096,19 @@ def run_erc(
             "suggestions": len(suggestions),
         },
         "stats": stats,
+        "spec_applied": design_spec is not None,
         "markdown_report": report,
     }
+
+    if spec_stats:
+        result["spec_stats"] = spec_stats
+
+    if actions is not None:
+        result["actions"] = actions
+    if action_stats is not None:
+        result["action_stats"] = action_stats
+
+    return result
 
 
 def _format_markdown_report(
@@ -1011,27 +2119,58 @@ def _format_markdown_report(
     warnings: list[dict],
     suggestions: list[dict],
     stats: dict,
+    spec_applied: bool = False,
+    spec_stats: dict | None = None,
+    generic_errors: list[dict] | None = None,
+    generic_warnings: list[dict] | None = None,
+    generic_suggestions: list[dict] | None = None,
+    spec_errors: list[dict] | None = None,
+    spec_warnings: list[dict] | None = None,
+    spec_suggestions: list[dict] | None = None,
+    actions: list[dict] | None = None,
 ) -> str:
     """生成 Markdown 格式的 ERC 审查报告。"""
     total = len(errors) + len(warnings) + len(suggestions)
+
+    spec_extra = ""
+    if spec_applied and spec_stats:
+        spec_extra = (
+            f" | Design Spec: ✅ 已应用"
+            f" | 手册要求: {spec_stats.get('requirements_passed',0)}/{spec_stats.get('requirements_checked',0)} 满足"
+            f" | 排除误报: {spec_stats.get('exclusions_applied',0)}"
+        )
 
     lines = [
         f"## ERC 审查报告：{project_name}",
         "",
         f"> 审查时间：{timestamp}",
-        f"> 检查项：{len(checks)} | ❌ 错误：{len(errors)} | ⚠️ 警告：{len(warnings)} | 💡 建议：{len(suggestions)}",
+        f"> 检查项：{len(checks)} | ❌ 错误：{len(errors)} | ⚠️ 警告：{len(warnings)} | 💡 建议：{len(suggestions)}{spec_extra}",
         "",
         "---",
         "",
     ]
 
-    # ❌ 错误
-    lines.append(f"### ❌ 错误 (必须修复) — {len(errors)} 项")
+    # ── 通用检查结果 ──
+    generic_err = generic_errors if generic_errors is not None else errors
+    generic_warn = generic_warnings if generic_warnings is not None else warnings
+    generic_sug = generic_suggestions if generic_suggestions is not None else suggestions
+
+    # 若 spec 被应用，只显示非 spec 的通用 finding
+    if spec_applied:
+        generic_err = [f for f in errors if f.get("check_type") != "spec"]
+        generic_warn = [f for f in warnings if f.get("check_type") != "spec"]
+        generic_sug = [f for f in suggestions if f.get("check_type") != "spec"]
+
+    lines.append(f"### 🔍 通用规则检查")
     lines.append("")
-    if errors:
+
+    # ❌ 错误
+    lines.append(f"#### ❌ 错误 (必须修复) — {len(generic_err)} 项")
+    lines.append("")
+    if generic_err:
         lines.append("| # | 位置 | 问题 | 详情 | 建议 |")
         lines.append("|---|------|------|------|------|")
-        for i, f in enumerate(errors, 1):
+        for i, f in enumerate(generic_err, 1):
             ref = f.get("component_ref", "")
             loc = f.get("location", "")
             msg = f.get("message", "")
@@ -1043,12 +2182,12 @@ def _format_markdown_report(
     lines.append("")
 
     # ⚠️ 警告
-    lines.append(f"### ⚠️ 警告 — {len(warnings)} 项")
+    lines.append(f"#### ⚠️ 警告 — {len(generic_warn)} 项")
     lines.append("")
-    if warnings:
+    if generic_warn:
         lines.append("| # | 位置 | 问题 | 详情 | 建议 |")
         lines.append("|---|------|------|------|------|")
-        for i, f in enumerate(warnings, 1):
+        for i, f in enumerate(generic_warn, 1):
             ref = f.get("component_ref", "")
             loc = f.get("location", "")
             msg = f.get("message", "")
@@ -1060,12 +2199,12 @@ def _format_markdown_report(
     lines.append("")
 
     # 💡 建议
-    lines.append(f"### 💡 建议 — {len(suggestions)} 项")
+    lines.append(f"#### 💡 建议 — {len(generic_sug)} 项")
     lines.append("")
-    if suggestions:
+    if generic_sug:
         lines.append("| # | 位置 | 问题 | 详情 | 建议 |")
         lines.append("|---|------|------|------|------|")
-        for i, f in enumerate(suggestions, 1):
+        for i, f in enumerate(generic_sug, 1):
             ref = f.get("component_ref", "")
             loc = f.get("location", "")
             msg = f.get("message", "")
@@ -1076,7 +2215,75 @@ def _format_markdown_report(
         lines.append("✅ 无建议。")
     lines.append("")
 
-    # 统计摘要
+    # ── 手册对照检查结果（仅当 spec 被应用时）──
+    if spec_applied:
+        spec_err = spec_errors or []
+        spec_warn = spec_warnings or []
+        spec_sug = spec_suggestions or []
+        spec_total = len(spec_err) + len(spec_warn) + len(spec_sug)
+
+        lines.append("---")
+        lines.append("")
+        lines.append(f"### 📋 手册对照检查（Design Spec 驱动）— {spec_total} 项")
+        lines.append("")
+
+        if spec_total == 0:
+            lines.append("✅ 所有手册要求均已满足。")
+            lines.append("")
+        else:
+            lines.append("| # | 类别 | 位置 | 判定 | 详情 | 依据 |")
+            lines.append("|---|------|------|------|------|------|")
+            all_spec = spec_err + spec_warn + spec_sug
+            for i, f in enumerate(all_spec, 1):
+                cat = SPEC_CATEGORY_NAMES.get(
+                    f.get("check_id", "").replace("spec_", ""), ""
+                )
+                ref = f.get("component_ref", "")
+                loc = f.get("location", "")
+                sev = f.get("severity", "")
+                sev_icon = {"error": "❌", "warning": "⚠️", "suggestion": "💡"}.get(sev, "")
+                msg = f.get("message", "")[:60]
+                source = f.get("source", "")[:50]
+                lines.append(
+                    f"| {i} | {cat} | {ref} {loc} | {sev_icon} {msg} | {source} |"
+                )
+
+            if spec_stats:
+                lines.append("")
+                passed = spec_stats.get("requirements_passed", 0)
+                checked = spec_stats.get("requirements_checked", 0)
+                lines.append(
+                    f"> 📊 手册要求满足率: **{passed}/{checked}**"
+                    f" ({passed/checked*100:.0f}%)"
+                    if checked > 0 else
+                    f"> 📊 手册要求满足率: **{passed}/{checked}**"
+                )
+
+        lines.append("")
+
+    # ── 可执行修复建议 ──
+    if actions:
+        lines.append("---")
+        lines.append("")
+        lines.append(f"### 🔧 可执行修复建议 — {len(actions)} 项")
+        lines.append("")
+        lines.append("| # | 操作 | 目标 | 参数 | 建议元件 | 置信度 | 依据 |")
+        lines.append("|---|------|------|------|---------|--------|------|")
+        for i, a in enumerate(actions, 1):
+            at = a.get("action_type", "?")
+            icon = _action_type_icon(at)
+            target_str = _format_action_target(a.get("target", {}))
+            params_str = _format_action_params(a.get("parameters", {}))
+            parts_str = _format_suggested_parts_short(a.get("parameters", {}))
+            conf = _confidence_label(a.get("confidence", ""))
+            ref = (a.get("source", {}).get("reference", ""))[:40]
+            lines.append(
+                f"| {i} | {icon} {at} | {target_str} | {params_str} | "
+                f"{parts_str} | {conf} | {ref} |"
+            )
+        lines.append("")
+
+    # ── 统计摘要 ──
     lines.append("---")
     lines.append("")
     lines.append("### 📊 统计摘要")
@@ -1110,18 +2317,91 @@ def _format_markdown_report(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Action 格式化辅助函数（Markdown 报告用）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ACTION_ICONS: dict[str, str] = {
+    "ADD_DECOUPLING_CAP": "🧩",
+    "ADD_PULLUP_RESISTOR": "⬆️",
+    "ADD_PULLDOWN_RESISTOR": "⬇️",
+    "ADD_CRYSTAL_LOAD_CAPS": "💎",
+    "CHANGE_CAPACITANCE": "🔄",
+    "CHANGE_RESISTANCE": "🔄",
+    "CONNECT_PIN_TO_NET": "🔗",
+    "DISCONNECT_PIN": "✂️",
+    "REVIEW_CRYSTAL_SELECTION": "🔍",
+    "REVIEW_MANUALLY": "👁️",
+}
+
+
+def _action_type_icon(action_type: str) -> str:
+    """返回 action type 对应的 emoji 图标。"""
+    return _ACTION_ICONS.get(action_type, "❓")
+
+
+def _confidence_label(confidence: str) -> str:
+    """返回置信度标签。"""
+    return {"high": "🟢 高", "medium": "🟡 中", "low": "🔴 低"}.get(confidence, confidence)
+
+
+def _format_action_target(target: dict) -> str:
+    """格式化 action target 为简短字符串。"""
+    parts = []
+    if target.get("component_ref"):
+        parts.append(target["component_ref"])
+    if target.get("pin"):
+        parts.append(f"Pin{target['pin']}")
+    if target.get("net"):
+        parts.append(f"({target['net']})")
+    if target.get("crystal_ref"):
+        parts.append(target["crystal_ref"])
+    return " ".join(parts) if parts else "-"
+
+
+def _format_action_params(params: dict) -> str:
+    """格式化 action parameters 为简短字符串。"""
+    parts = []
+    if params.get("cap_value"):
+        parts.append(params["cap_value"])
+    if params.get("resistor_value"):
+        parts.append(params["resistor_value"])
+    if params.get("resistor_target_value"):
+        parts.append(f"→{params['resistor_target_value']}")
+    if params.get("suggested_cap_value"):
+        parts.append(params["suggested_cap_value"])
+    if params.get("cap_value_pf"):
+        parts.append(f"{params['cap_value_pf']:.0f}pF")
+    if params.get("from_net") and params.get("to_net"):
+        parts.append(f"{params['from_net']}→{params['to_net']}")
+    return " ".join(parts) if parts else "-"
+
+
+def _format_suggested_parts_short(params: dict) -> str:
+    """格式化 LCSC 推荐为简短的 Markdown 内字符串。"""
+    parts_list = params.get("suggested_parts", [])
+    if not parts_list:
+        return "-"
+    # 显示排名最高的 1 个
+    best = parts_list[0]
+    pkg = best.get("package", "")
+    lcsc = best.get("lcsc", "")
+    return f"{lcsc} ({pkg})"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="嘉立创 EDA ERC 检查引擎 — 7 项电气规则检查",
+        description="嘉立创 EDA ERC 检查引擎 — 7 项通用检查 + Design Spec 驱动精确对照",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   python phase2_erc_check.py netlist.json
   python phase2_erc_check.py netlist.json --format json
   python phase2_erc_check.py netlist.json --check decoupling,i2c
+  python phase2_erc_check.py netlist.json --spec design_spec.json
         """,
     )
     parser.add_argument(
@@ -1147,6 +2427,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--datasheet",
         help="数据手册上下文 JSON 文件 (可选, Phase 1 输出)",
+    )
+    parser.add_argument(
+        "--spec",
+        type=str,
+        default=None,
+        help="Design Spec JSON 文件路径（Phase 1 产出），启用手册精确对照检查",
+    )
+    parser.add_argument(
+        "--actions",
+        action="store_true",
+        help="生成结构化可执行修复建议（含 LCSC 元件推荐），输出到 JSON actions 字段和 Markdown 报告",
     )
     return parser
 
@@ -1182,12 +2473,28 @@ def main() -> None:
                   file=sys.stderr)
             sys.exit(1)
 
+    # 读取 Design Spec (可选)
+    design_spec = None
+    if args.spec:
+        try:
+            design_spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+        except Exception as e:
+            print(json.dumps({"error": f"读取 Design Spec 失败: {e}"}, ensure_ascii=False),
+                  file=sys.stderr)
+            sys.exit(1)
+
     # 解析检查项
     checks = None
     if args.check:
         checks = [c.strip() for c in args.check.split(",") if c.strip()]
 
-    result = run_erc(netlist, datasheet_ctx, checks)
+    result = run_erc(
+        netlist,
+        datasheet_context=datasheet_ctx,
+        design_spec=design_spec,
+        checks=checks,
+        generate_actions=args.actions,
+    )
 
     if args.format == "json":
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))

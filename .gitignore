@@ -1,17 +1,18 @@
 # Python virtual environment
 .venv/
 
-# Python cache
+# Python bytecode / cache
 __pycache__/
 *.py[cod]
+*.pyo
 *$py.class
 *.egg-info/
 dist/
 build/
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
@@ -24,5 +25,16 @@ Thumbs.db
 /tmp/
 *.tmp
 
+# Projects and datasheets (large files, not tracked)
 jlc_project/
 datasheets/
+samples/
+specs/
+
+# External EEXT demos (not part of the skill)
+eext-easyeda-api-agent/
+eext-external-tool-integration-demo/
+eext-generate-schematic-from-netlist/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/

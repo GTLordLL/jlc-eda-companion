@@ -1,7 +1,7 @@
 {
   "name": "jlc-eda-companion",
-  "version": "0.2.0",
-  "description": "嘉立创 EDA PCB设计全流程助手 — 阶段一：芯片选型与BOM | 阶段二：原理图ERC审查",
+  "version": "0.4.0",
+  "description": "嘉立创 EDA PCB设计全流程助手 — 阶段一：芯片选型与BOM | 阶段二：原理图ERC审查 + 可执行修复建议",
   "author": "jlc-eda-companion",
   "tools": [
     {
@@ -43,7 +43,7 @@
     {
       "name": "phase2_erc_check",
       "command": "python jlc-eda-companion/tools/phase2_erc_check.py",
-      "description": "ERC 电气规则检查引擎（7项）：去耦电容、EN/复位上下拉、I2C上拉、反馈分压、晶振电容、悬空引脚、电源短路",
+      "description": "ERC 电气规则检查引擎（7+5项）：通用规则 + Design Spec 手册精确对照。支持 --spec 精确对照、--actions 可执行修复建议（含 LCSC 元件推荐）",
       "args": ["--stdin"]
     },
     {
@@ -71,8 +71,11 @@
       "triggers": ["ERC", "电气规则检查", "原理图审查", "检查原理图", "原理图检查",
                     "去耦电容", "上拉电阻", "I2C上拉", "反馈电阻", "晶振电容",
                     "悬空引脚", "电源短路", "浮空", ".eprj2", ".epro2", "工程文件",
-                    "提取网表", "网表", "netlist"],
-      "description": "解析嘉立创EDA工程→提取网表→7项ERC检查→对照Design Spec生成审查报告"
+                    "提取网表", "网表", "netlist",
+                    "修复建议", "可执行建议", "action", "fix suggestion",
+                    "添加去耦电容", "添加上拉", "修改电容值", "修改电阻值",
+                    "LCSC推荐", "元件替换建议"],
+      "description": "解析嘉立创EDA工程→提取网表→7项通用ERC→对照Design Spec生成精确审查报告（含手册出处）→生成可执行修复建议（含LCSC元件推荐）"
     },
     "1-2": {
       "name": "Design Spec 生成（Phase 1→2 桥梁）",
