@@ -84,7 +84,7 @@
       "description": "AMS1117-3.3 输入 Pin2 (VIN) 需 100nF 去耦 + 10µF 滤波电容",
       "rule": {
         "target_chip": "U1",
-        "pin_pattern": "VIN",
+        "pin_pattern": "VCC\\+5V|VIN",
         "cap_value": "100nF",
         "cap_value_f": 1e-7,
         "tolerance": 0.2,
